@@ -132,20 +132,20 @@ def parse_announcements(api_response: dict[str, Any]) -> list[Filing]:
 
         filings.append(
             Filing(
-                announcement_id=ann.get("announcementId", ""),
-                sec_code=ann.get("secCode", ""),
-                sec_name=ann.get("secName", ""),
+                filing_id=ann.get("announcementId", ""),
+                ticker=ann.get("secCode", ""),
+                company_name=ann.get("secName", ""),
                 org_id=ann.get("orgId", ""),
                 org_name=ann.get("orgName", ""),
-                title=title,
-                announcement_date=announcement_date,
+                headline=title,
+                filing_date=announcement_date,
                 announcement_time_ms=ts_ms,
-                adjunct_url=adjunct_url,
+                document_url=adjunct_url,
                 adjunct_type=ann.get("adjunctType", "PDF"),
-                adjunct_size=ann.get("adjunctSize", 0) or 0,
-                announcement_type=announcement_type_code,
+                file_size=ann.get("adjunctSize", 0) or 0,
+                category=announcement_type_code,
                 column_id=ann.get("columnId", ""),
-                download_url=f"{STATIC_URL}/{adjunct_url}",
+                direct_download_url=f"{STATIC_URL}/{adjunct_url}",
                 filing_type=filing_type,
             )
         )

@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import logging.handlers
 import os
@@ -35,6 +36,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -42,11 +44,14 @@ import requests
 from db import (
     DB_FILE,
     CrawlResult,
+    detect_health,
     export_json,
     get_db,
     get_known_ids,
     get_last_crawl_date,
     insert_batch,
+    log_crawl_complete,
+    log_crawl_start,
     stats,
 )
 from downloader import batch_download
@@ -282,8 +287,12 @@ def _polite_delay() -> None:
 # ---------------------------------------------------------------------------
 
 
-def cmd_crawl(args: argparse.Namespace) -> None:
-    """Crawl CNINFO filings with optional date-range splitting."""
+def cmd_crawl(args: argparse.Namespace) -> int:
+    """Crawl CNINFO filings with optional date-range splitting.
+
+    Returns:
+        Exit code: 0 = success, 1 = partial failure, 3 = fatal error.
+    """
     conn = get_db(args.db)
     session = make_session()
 
@@ -308,6 +317,17 @@ def cmd_crawl(args: argparse.Namespace) -> None:
     total_filings = 0
     total_new = 0
     total_downloaded = 0
+    error_count = 0
+
+    crawl_log_id = log_crawl_start(
+        conn,
+        parameters={
+            "category": args.category or "all",
+            "column": args.column,
+            "date_from": getattr(args, "date_from", None),
+            "date_to": getattr(args, "date_to", None),
+        },
+    )
 
     try:
         if args.date_from and args.date_to:
@@ -458,6 +478,7 @@ def cmd_crawl(args: argparse.Namespace) -> None:
                             total_downloaded += r_d
                         except Exception as exc:
                             log.error("Date range %s failed: %s", futs[fut], exc)
+                            error_count += 1
             else:
                 for idx_dr in enumerate(all_ranges, 1):
                     r_f, r_n, r_d = _crawl_date_range(idx_dr)
@@ -552,6 +573,13 @@ def cmd_crawl(args: argparse.Namespace) -> None:
             elapsed,
             db_stats.get("total") or 0,
             db_stats.get("unique_companies") or 0,
+        )
+        log_crawl_complete(
+            conn,
+            crawl_log_id,
+            filings_found=total_filings,
+            filings_new=total_new,
+            error_count=error_count,
         )
         result = CrawlResult(
             filings_found=total_filings,
@@ -687,24 +715,85 @@ def cmd_monitor(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def cmd_export(args: argparse.Namespace) -> None:
-    """Export cached filings to JSON."""
-    conn = get_db(args.db)
-    export_json(conn, args.output)
-    conn.close()
+def cmd_export(args: argparse.Namespace) -> int:
+    """Export cached filings to JSON.
+
+    Returns:
+        Exit code 0 on success, 3 on fatal error.
+    """
+    try:
+        conn = get_db(args.db)
+        export_json(conn, args.output)
+        conn.close()
+        return 0
+    except Exception as exc:
+        log.error("Export failed: %s", exc)
+        return 3
 
 
-def cmd_stats(args: argparse.Namespace) -> None:
-    """Print filing cache statistics."""
-    conn = get_db(args.db)
-    s = stats(conn)
-    print(f"Total filings:    {s.get('total') or 0}")
-    print(f"Downloaded:       {s.get('downloaded') or 0}")
-    print(f"Pending:          {s.get('pending') or 0}")
-    print(f"Companies:        {s.get('unique_companies') or 0}")
-    print(f"Oldest filing:    {s.get('oldest') or 'N/A'}")
-    print(f"Newest filing:    {s.get('newest') or 'N/A'}")
-    conn.close()
+def _get_documents_size(doc_dir: str) -> int:
+    """Return total bytes used by downloaded documents directory."""
+    doc_path = Path(doc_dir)
+    if not doc_path.exists():
+        return 0
+    total = 0
+    for f in doc_path.rglob("*"):
+        if f.is_file():
+            try:
+                total += f.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    """Print filing cache statistics.
+
+    When ``args.json`` is True, outputs a JSON blob to stdout suitable for
+    inter-scraper aggregation.  Otherwise prints a human-readable summary.
+
+    Returns:
+        Exit code 0 on success, 3 on fatal error.
+    """
+    try:
+        conn = get_db(args.db)
+        s = stats(conn)
+        health = detect_health(conn)
+        conn.close()
+    except Exception as exc:
+        log.error("Stats failed: %s", exc)
+        return 3
+
+    if getattr(args, "json", False):
+        db_path = Path(args.db)
+        db_size = db_path.stat().st_size if db_path.exists() else 0
+        doc_dir = getattr(args, "doc_dir", "documents")
+        payload = {
+            "scraper": "china-scraper",
+            "country": "CN",
+            "sources": ["cninfo"],
+            "total_filings": s.get("total") or 0,
+            "downloaded": s.get("downloaded") or 0,
+            "pending_download": s.get("pending") or 0,
+            "unique_companies": s.get("unique_companies") or 0,
+            "total_crawl_runs": s.get("total_crawl_runs") or 0,
+            "earliest_record": s.get("oldest"),
+            "latest_record": s.get("newest"),
+            "db_size_bytes": db_size,
+            "documents_size_bytes": _get_documents_size(doc_dir),
+            "health": health,
+        }
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(f"Total filings:    {s.get('total') or 0}")
+        print(f"Downloaded:       {s.get('downloaded') or 0}")
+        print(f"Pending:          {s.get('pending') or 0}")
+        print(f"Companies:        {s.get('unique_companies') or 0}")
+        print(f"Crawl runs:       {s.get('total_crawl_runs') or 0}")
+        print(f"Oldest filing:    {s.get('oldest') or 'N/A'}")
+        print(f"Newest filing:    {s.get('newest') or 'N/A'}")
+        print(f"Health:           {health}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -800,12 +889,30 @@ def main() -> None:
     # -- stats --
     st = sub.add_parser("stats", help="Show cache statistics")
     st.add_argument("--db", default=DB_FILE)
+    st.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Output stats as a JSON blob to stdout (for inter-scraper aggregation). "
+            "Exit code 0 = ok, 3 = error."
+        ),
+    )
+    st.add_argument(
+        "--doc-dir",
+        default="documents",
+        help="Documents directory for size calculation (default: documents)",
+    )
 
     args = p.parse_args()
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
     _configure_logging(getattr(args, "log_file", None))
 
+    # Exit-code semantics:
+    #   0 — success
+    #   1 — partial failure (unused here, reserved)
+    #   2 — configuration error
+    #   3 — fatal error
     cmds = {
         "crawl": cmd_crawl,
         "monitor": cmd_monitor,
@@ -813,9 +920,13 @@ def main() -> None:
         "stats": cmd_stats,
     }
     if args.command in cmds:
-        cmds[args.command](args)
+        result = cmds[args.command](args)
+        # monitor returns None (runs until Ctrl+C); treat as success
+        if isinstance(result, int):
+            sys.exit(result)
     else:
         p.print_help()
+        sys.exit(2)
 
 
 if __name__ == "__main__":

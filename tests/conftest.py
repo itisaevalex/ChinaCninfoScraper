@@ -67,24 +67,24 @@ def mem_db() -> sqlite3.Connection:
 
 @pytest.fixture
 def sample_filing():
-    """A valid Filing dataclass instance for DB tests."""
+    """A valid Filing dataclass instance for DB tests (L3 schema)."""
     from db import Filing
 
     return Filing(
-        announcement_id="1219488813",
-        sec_code="000001",
-        sec_name="平安银行",
+        filing_id="1219488813",
+        ticker="000001",
+        company_name="平安银行",
         org_id="gssz0000001",
         org_name="平安银行股份有限公司",
-        title="平安银行股份有限公司2023年年度报告",
-        announcement_date="2024-03-30",
+        headline="平安银行股份有限公司2023年年度报告",
+        filing_date="2024-03-30",
         announcement_time_ms=1711728000000,
-        adjunct_url="finalpage/2024-03-30/1219488813.PDF",
+        document_url="finalpage/2024-03-30/1219488813.PDF",
         adjunct_type="PDF",
-        adjunct_size=8543,
-        announcement_type="category_ndbg_szsh",
+        file_size=8543,
+        category="category_ndbg_szsh",
         column_id="col_szse_annual",
-        download_url="http://static.cninfo.com.cn/finalpage/2024-03-30/1219488813.PDF",
+        direct_download_url="http://static.cninfo.com.cn/finalpage/2024-03-30/1219488813.PDF",
         filing_type="annual_report",
     )
 
@@ -95,19 +95,19 @@ def sample_filing_2():
     from db import Filing
 
     return Filing(
-        announcement_id="2300145722",
-        sec_code="600519",
-        sec_name="贵州茅台",
+        filing_id="2300145722",
+        ticker="600519",
+        company_name="贵州茅台",
         org_id="gssh0600519",
         org_name="贵州茅台酒股份有限公司",
-        title="贵州茅台酒股份有限公司2023年半年度报告",
-        announcement_date="2023-08-15",
+        headline="贵州茅台酒股份有限公司2023年半年度报告",
+        filing_date="2023-08-15",
         announcement_time_ms=1692057600000,
-        adjunct_url="finalpage/2023-08-15/2300145722.PDF",
+        document_url="finalpage/2023-08-15/2300145722.PDF",
         adjunct_type="PDF",
-        adjunct_size=6100,
-        announcement_type="category_bndbg_szsh",
+        file_size=6100,
+        category="category_bndbg_szsh",
         column_id="col_sse_semi",
-        download_url="http://static.cninfo.com.cn/finalpage/2023-08-15/2300145722.PDF",
+        direct_download_url="http://static.cninfo.com.cn/finalpage/2023-08-15/2300145722.PDF",
         filing_type="half_yearly",
     )

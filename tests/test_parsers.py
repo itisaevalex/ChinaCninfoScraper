@@ -128,41 +128,41 @@ class TestParseAnnouncements:
         filings = parse_announcements(cninfo_empty_response)
         assert filings == []
 
-    def test_filings_have_correct_sec_codes(self, cninfo_query_response):
+    def test_filings_have_correct_tickers(self, cninfo_query_response):
         filings = parse_announcements(cninfo_query_response)
-        codes = {f.sec_code for f in filings}
-        assert "000001" in codes
-        assert "600519" in codes
+        tickers = {f.ticker for f in filings}
+        assert "000001" in tickers
+        assert "600519" in tickers
 
-    def test_download_url_uses_static_cdn(self, cninfo_query_response):
-        filings = parse_announcements(cninfo_query_response)
-        for f in filings:
-            assert f.download_url.startswith("http://static.cninfo.com.cn/")
-
-    def test_download_url_contains_adjunct_url(self, cninfo_query_response):
+    def test_direct_download_url_uses_static_cdn(self, cninfo_query_response):
         filings = parse_announcements(cninfo_query_response)
         for f in filings:
-            assert f.adjunct_url in f.download_url
+            assert f.direct_download_url.startswith("http://static.cninfo.com.cn/")
 
-    def test_announcement_date_is_formatted_correctly(self, cninfo_query_response):
+    def test_direct_download_url_contains_document_url(self, cninfo_query_response):
+        filings = parse_announcements(cninfo_query_response)
+        for f in filings:
+            assert f.document_url in f.direct_download_url
+
+    def test_filing_date_is_formatted_correctly(self, cninfo_query_response):
         filings = parse_announcements(cninfo_query_response)
         for f in filings:
             # Should be YYYY-MM-DD
-            parts = f.announcement_date.split("-")
+            parts = f.filing_date.split("-")
             assert len(parts) == 3
             assert len(parts[0]) == 4
 
     def test_first_filing_is_annual_report(self, cninfo_query_response):
         filings = parse_announcements(cninfo_query_response)
-        annual = next(f for f in filings if f.sec_code == "000001")
+        annual = next(f for f in filings if f.ticker == "000001")
         assert annual.filing_type == "annual_report"
 
     def test_second_filing_is_half_yearly(self, cninfo_query_response):
         filings = parse_announcements(cninfo_query_response)
-        semi = next(f for f in filings if f.sec_code == "600519")
+        semi = next(f for f in filings if f.ticker == "600519")
         assert semi.filing_type == "half_yearly"
 
-    def test_em_tags_stripped_from_title(self):
+    def test_em_tags_stripped_from_headline(self):
         response = {
             "totalAnnouncement": 1,
             "totalpages": 1,
@@ -186,14 +186,14 @@ class TestParseAnnouncements:
         }
         filings = parse_announcements(response)
         assert len(filings) == 1
-        assert "<em>" not in filings[0].title
-        assert "</em>" not in filings[0].title
-        assert filings[0].title == "年度报告"
+        assert "<em>" not in filings[0].headline
+        assert "</em>" not in filings[0].headline
+        assert filings[0].headline == "年度报告"
 
     def test_entry_without_adjunct_url_is_skipped(self, cninfo_multi_type_response):
         filings = parse_announcements(cninfo_multi_type_response)
         # ann_no_url_001 has empty adjunctUrl and should be skipped
-        ids = {f.announcement_id for f in filings}
+        ids = {f.filing_id for f in filings}
         assert "ann_no_url_001" not in ids
 
     def test_multi_type_response_produces_correct_count(self, cninfo_multi_type_response):
@@ -240,7 +240,7 @@ class TestParseAnnouncements:
             ],
         }
         filings = parse_announcements(response)
-        assert filings[0].announcement_date == ""
+        assert filings[0].filing_date == ""
 
     def test_none_timestamp_produces_empty_date(self):
         response = {
@@ -265,8 +265,8 @@ class TestParseAnnouncements:
             ],
         }
         filings = parse_announcements(response)
-        assert filings[0].announcement_date == ""
-        assert filings[0].adjunct_size == 0
+        assert filings[0].filing_date == ""
+        assert filings[0].file_size == 0
 
 
 # ---------------------------------------------------------------------------

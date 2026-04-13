@@ -26,7 +26,18 @@ from db import get_db, upsert_filing, is_downloaded
 
 
 class TestBuildFilename:
-    def test_includes_sec_code_prefix(self):
+    def test_includes_ticker_prefix(self):
+        filing = {
+            "ticker": "000001",
+            "filing_id": "1234567890",
+            "headline": "年度报告",
+            "adjunct_type": "PDF",
+        }
+        name = _build_filename(filing)
+        assert name.startswith("000001_")
+
+    def test_includes_ticker_prefix_legacy_field(self):
+        """Backwards compat: sec_code still works."""
         filing = {
             "sec_code": "000001",
             "announcement_id": "1234567890",
@@ -36,7 +47,19 @@ class TestBuildFilename:
         name = _build_filename(filing)
         assert name.startswith("000001_")
 
-    def test_includes_truncated_announcement_id(self):
+    def test_includes_truncated_filing_id(self):
+        filing = {
+            "ticker": "000001",
+            "filing_id": "ABCDEFGHIJ",
+            "headline": "报告",
+            "adjunct_type": "PDF",
+        }
+        name = _build_filename(filing)
+        # filing_id[:8] = "ABCDEFGH"
+        assert "ABCDEFGH" in name
+
+    def test_includes_truncated_announcement_id_legacy(self):
+        """Backwards compat: announcement_id[:8] still appears in filename."""
         filing = {
             "sec_code": "000001",
             "announcement_id": "ABCDEFGHIJ",
@@ -44,14 +67,13 @@ class TestBuildFilename:
             "adjunct_type": "PDF",
         }
         name = _build_filename(filing)
-        # announcement_id[:8] = "ABCDEFGH"
         assert "ABCDEFGH" in name
 
     def test_extension_is_uppercased(self):
         filing = {
-            "sec_code": "000001",
-            "announcement_id": "12345678",
-            "title": "Report",
+            "ticker": "000001",
+            "filing_id": "12345678",
+            "headline": "Report",
             "adjunct_type": "pdf",
         }
         name = _build_filename(filing)
@@ -59,9 +81,9 @@ class TestBuildFilename:
 
     def test_removes_illegal_filesystem_chars(self):
         filing = {
-            "sec_code": "000001",
-            "announcement_id": "12345678",
-            "title": 'bad/name:with"chars',
+            "ticker": "000001",
+            "filing_id": "12345678",
+            "headline": 'bad/name:with"chars',
             "adjunct_type": "PDF",
         }
         name = _build_filename(filing)
@@ -70,14 +92,13 @@ class TestBuildFilename:
 
     def test_title_truncated_to_70_chars(self):
         filing = {
-            "sec_code": "000001",
-            "announcement_id": "12345678",
-            "title": "A" * 200,
+            "ticker": "000001",
+            "filing_id": "12345678",
+            "headline": "A" * 200,
             "adjunct_type": "PDF",
         }
         name = _build_filename(filing)
-        # sec_code(6) + _ + id[:8] + _ + title[:70] + .PDF
-        # The title portion of the name should not exceed 70 chars
+        # ticker(6) + _ + id[:8] + _ + title[:70] + .PDF
         parts = name.split("_", 2)
         title_part = parts[2].rsplit(".", 1)[0]
         assert len(title_part) <= 70
@@ -177,13 +198,13 @@ class TestDownloadOne:
 
 
 class TestBatchDownload:
-    def _make_filing_dict(self, ann_id: str, sec_code: str = "000001") -> dict:
+    def _make_filing_dict(self, filing_id: str, ticker: str = "000001") -> dict:
         return {
-            "announcement_id": ann_id,
-            "sec_code": sec_code,
-            "title": "年度报告",
+            "filing_id": filing_id,
+            "ticker": ticker,
+            "headline": "年度报告",
             "adjunct_type": "PDF",
-            "download_url": f"http://static.cninfo.com.cn/finalpage/2024/{ann_id}.PDF",
+            "direct_download_url": f"http://static.cninfo.com.cn/finalpage/2024/{filing_id}.PDF",
         }
 
     def test_downloads_new_filings(self, mem_db, tmp_path):
@@ -197,14 +218,14 @@ class TestBatchDownload:
     ):
         upsert_filing(mem_db, sample_filing)
         from db import mark_downloaded as db_mark
-        db_mark(mem_db, sample_filing.announcement_id, "/tmp/already.pdf")
+        db_mark(mem_db, sample_filing.filing_id, "/tmp/already.pdf")
 
         filing_dict = {
-            "announcement_id": sample_filing.announcement_id,
-            "sec_code": sample_filing.sec_code,
-            "title": sample_filing.title,
+            "filing_id": sample_filing.filing_id,
+            "ticker": sample_filing.ticker,
+            "headline": sample_filing.headline,
             "adjunct_type": sample_filing.adjunct_type,
-            "download_url": sample_filing.download_url,
+            "direct_download_url": sample_filing.direct_download_url,
         }
 
         with patch("downloader.download_one") as mock_dl:
@@ -216,32 +237,32 @@ class TestBatchDownload:
     def test_marks_successful_download_in_db(self, mem_db, tmp_path):
         from db import Filing, upsert_filing as _upsert
 
-        ann_id = "batch_test_mark"
+        filing_id = "batch_test_mark"
         filing_obj = Filing(
-            announcement_id=ann_id,
-            sec_code="000001",
-            sec_name="测试",
+            filing_id=filing_id,
+            ticker="000001",
+            company_name="测试",
             org_id="org1",
             org_name="测试公司",
-            title="年度报告",
-            announcement_date="2024-03-30",
+            headline="年度报告",
+            filing_date="2024-03-30",
             announcement_time_ms=1711728000000,
-            adjunct_url="finalpage/2024-03-30/batch_test_mark.PDF",
+            document_url="finalpage/2024-03-30/batch_test_mark.PDF",
             adjunct_type="PDF",
-            adjunct_size=100,
-            announcement_type="category_ndbg_szsh",
+            file_size=100,
+            category="category_ndbg_szsh",
             column_id="col_szse",
-            download_url=f"http://static.cninfo.com.cn/finalpage/2024-03-30/{ann_id}.PDF",
+            direct_download_url=f"http://static.cninfo.com.cn/finalpage/2024-03-30/{filing_id}.PDF",
             filing_type="annual_report",
         )
         _upsert(mem_db, filing_obj)
 
         filing_dict = {
-            "announcement_id": ann_id,
-            "sec_code": "000001",
-            "title": "年度报告",
+            "filing_id": filing_id,
+            "ticker": "000001",
+            "headline": "年度报告",
             "adjunct_type": "PDF",
-            "download_url": filing_obj.download_url,
+            "direct_download_url": filing_obj.direct_download_url,
         }
 
         def fake_download(url, dest, aid):
@@ -251,7 +272,7 @@ class TestBatchDownload:
         with patch("downloader.download_one", side_effect=fake_download):
             batch_download(mem_db, [filing_dict], str(tmp_path), workers=1)
 
-        assert is_downloaded(mem_db, ann_id) is True
+        assert is_downloaded(mem_db, filing_id) is True
 
     def test_empty_list_returns_zero(self, mem_db, tmp_path):
         assert batch_download(mem_db, [], str(tmp_path)) == 0

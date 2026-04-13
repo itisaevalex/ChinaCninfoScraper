@@ -39,17 +39,20 @@ DELAY_JITTER = 0.5
 def _build_filename(filing: dict) -> str:
     """Construct a safe, collision-resistant filename for a filing.
 
-    Uses ``announcement_id`` prefix to prevent title collisions.
+    Uses ``filing_id`` prefix to prevent title collisions.
+    Accepts both L3 field names (filing_id, ticker, headline) and legacy
+    names (announcement_id, sec_code, title) for backwards compatibility.
 
     Args:
-        filing: Dict with keys sec_code, announcement_id, title, adjunct_type.
+        filing: Dict with keys ticker/sec_code, filing_id/announcement_id,
+                headline/title, adjunct_type.
 
     Returns:
         A filesystem-safe filename string.
     """
-    sec_code = filing.get("sec_code", "unknown")
-    ann_id = filing.get("announcement_id", "unknown")
-    title = filing.get("title", "doc")
+    sec_code = filing.get("ticker") or filing.get("sec_code", "unknown")
+    ann_id = filing.get("filing_id") or filing.get("announcement_id", "unknown")
+    title = filing.get("headline") or filing.get("title", "doc")
     ext = filing.get("adjunct_type", "PDF").upper()
 
     safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title)
@@ -112,17 +115,19 @@ def _worker(filing: dict, doc_dir: str) -> tuple[str, str] | None:
     """Thread worker: download one filing document.
 
     Creates no database connections — all DB writes happen on the calling thread.
+    Accepts both L3 field names and legacy names for backwards compatibility.
 
     Args:
-        filing:  Dict with download_url, announcement_id, sec_code, title,
+        filing:  Dict with direct_download_url/download_url,
+                 filing_id/announcement_id, ticker/sec_code, headline/title,
                  adjunct_type fields.
         doc_dir: Directory path where documents are saved.
 
     Returns:
-        (announcement_id, local_path) on success, None on failure.
+        (filing_id, local_path) on success, None on failure.
     """
-    url = filing.get("download_url", "")
-    ann_id = filing.get("announcement_id", "")
+    url = filing.get("direct_download_url") or filing.get("download_url", "")
+    ann_id = filing.get("filing_id") or filing.get("announcement_id", "")
     if not url or not ann_id:
         return None
 
@@ -158,7 +163,11 @@ def batch_download(
     """
     to_download = [
         f for f in filings
-        if f.get("download_url") and not is_downloaded(conn, f["announcement_id"])
+        if (f.get("direct_download_url") or f.get("download_url"))
+        and not is_downloaded(
+            conn,
+            f.get("filing_id") or f.get("announcement_id", ""),
+        )
     ]
     if not to_download:
         return 0
@@ -169,7 +178,9 @@ def batch_download(
     if workers > 1 and len(to_download) > 1:
         with ThreadPoolExecutor(max_workers=min(workers, len(to_download))) as pool:
             futs = {
-                pool.submit(_worker, f, doc_dir): f["announcement_id"]
+                pool.submit(_worker, f, doc_dir): (
+                    f.get("filing_id") or f.get("announcement_id", "")
+                )
                 for f in to_download
             }
             for fut in as_completed(futs):
