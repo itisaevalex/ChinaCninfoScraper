@@ -1,8 +1,31 @@
-# China Securities Filing Scraper (CNINFO / 巨潮资讯网)
+<div align="center">
+
+```
+ ██████╗███╗   ██╗██╗███╗   ██╗███████╗ ██████╗ 
+██╔════╝████╗  ██║██║████╗  ██║██╔════╝██╔═══██╗
+██║     ██╔██╗ ██║██║██╔██╗ ██║█████╗  ██║   ██║
+██║     ██║╚██╗██║██║██║╚██╗██║██╔══╝  ██║   ██║
+╚██████╗██║ ╚████║██║██║ ╚████║██║     ╚██████╔╝
+ ╚═════╝╚═╝  ╚═══╝╚═╝╚═╝  ╚═══╝╚═╝      ╚═════╝ 
+      ███████╗ ██████╗██████╗  █████╗ ██████╗ ███████╗██████╗ 
+      ██╔════╝██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗
+      ███████╗██║     ██████╔╝███████║██████╔╝█████╗  ██████╔╝
+      ╚════██║██║     ██╔══██╗██╔══██║██╔═══╝ ██╔══╝  ██╔══██╗
+      ███████║╚██████╗██║  ██║██║  ██║██║     ███████╗██║  ██║
+      ╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝
+```
+
+**China's EDGAR — 巨潮资讯网 scraped with plain HTTP requests. No browser needed.**
+
+*380K+ filings across all Chinese exchanges. Pure `requests`. One dependency. Zero bot protection.*
+
+</div>
+
+---
 
 Production scraper for China's primary securities filing disclosure system. Extracts filing metadata and downloads documents (annual reports, prospectuses, financial statements) from [CNINFO](http://www.cninfo.com.cn) into structured JSON + PDF files.
 
-Part of a multi-country financial filings scraper project alongside Canada (SEDAR+) and Mexico (CNBV).
+Part of a multi-country financial filings scraper project alongside [Canada (SEDAR+)](https://github.com/itisaevalex/SedarPlusScraper) and [Mexico (CNBV)](https://github.com/itisaevalex/MexicanReportsScraperExtended).
 
 ## Quick Start
 
