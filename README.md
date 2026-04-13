@@ -179,6 +179,27 @@ The methodology from CLAUDE.md includes 8 phases for reverse-engineering governm
 
 This is documented as a data point for future scrapers: Chinese government portals may have lighter bot protection than North American ones.
 
+### Phase 6: Code Review & Hardening
+
+Ran an automated code review which found 5 HIGH-severity issues. All were fixed before declaring production-ready:
+
+1. **SQLite thread safety** — `check_same_thread=False` for `--concurrency` mode
+2. **Session sharing** — per-worker `requests.Session` in concurrent date-range processing
+3. **Disk-full handling** — atomic `.part` file writes, propagate `OSError` instead of swallowing it (this bug was triggered during the 5.5 GB test run)
+4. **PDF validation** — verify `%PDF-` magic bytes before saving (CDN can return HTML error pages with HTTP 200)
+5. **Filename collisions** — `announcement_id` prefix prevents overwrites from duplicate titles
+
+### Validation Results
+
+| Metric | Result |
+|--------|--------|
+| Filings scraped | 2,055 (March 2024 annual reports) |
+| PDFs downloaded | 2,055 (5.5 GB) |
+| API errors | 0 |
+| Download failures | 0 (after header fix) |
+| Rate limiting | None observed |
+| Today's filings (Apr 2026) | Confirmed working (910 annual reports) |
+
 ## Output Format
 
 ### SQLite Schema (`filings_cache.db`)
@@ -228,13 +249,22 @@ PDFs are saved to `documents/` with the naming pattern: `{sec_code}_{title}.PDF`
 
 ```
 china-scraper/
-├── scraper.py              # Main scraper (single file, ~480 lines)
+├── scraper.py              # Main scraper (single file, ~550 lines)
 ├── requirements.txt        # Just: requests
-├── CLAUDE.md               # AI assistant context (methodology, targets)
+├── CLAUDE.md               # AI context + full reasoning trace
 ├── README.md               # This file
 ├── _investigation/         # Reverse-engineering artifacts
-│   └── phase1_api_reference.md
+│   ├── phase1_api_reference.md
+│   └── phase1_reconnaissance.txt
 ├── filings_cache.db        # SQLite cache (auto-generated)
 ├── documents/              # Downloaded PDFs (auto-generated)
 └── filings.json            # Exported JSON (via export command)
 ```
+
+## Sister Projects
+
+| Country | Portal | Repo |
+|---------|--------|------|
+| Canada | SEDAR+ | [SedarPlusScraper](https://github.com/itisaevalex/SedarPlusScraper) |
+| Mexico | CNBV STIV-2 | [MexicanReportsScraperExtended](https://github.com/itisaevalex/MexicanReportsScraperExtended) |
+| China | CNINFO 巨潮资讯网 | **This repo** |

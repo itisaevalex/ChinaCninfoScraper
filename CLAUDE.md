@@ -246,11 +246,26 @@ CNINFO caps API results at ~100 pages. Beyond that, it silently returns duplicat
 ### Test results (March 2024 annual reports)
 
 Full month test (31 date ranges, --max-pages 20, --download):
-- **1,500+ filings scraped** across all March 2024 dates
-- **1,500+ PDFs downloaded** (3+ GB)
-- **Zero errors** after the header fix
-- **Zero rate limiting or blocking**
-- Peak days: March 29 (486 filings), March 30 (575 filings), March 28 (241 filings)
+- **2,055 filings scraped** across all March 2024 dates
+- **2,055 PDFs downloaded** (5.5 GB) before hitting local disk limit
+- **Zero API errors** — no rate limiting, no blocking, no authentication failures
+- **Zero download failures** after the header fix (all 404s resolved)
+- Peak days: March 30 (575 filings, 19 pages), March 29 (486 filings, 16 pages), March 28 (241 filings, 8 pages)
+- April 2026 (today's filings) also confirmed working — 910 annual reports available
+
+### Code review and hardening
+
+Ran automated code review after initial test. Found 5 HIGH issues, all fixed:
+
+| Issue | Problem | Fix |
+|-------|---------|-----|
+| HIGH-1 | SQLite `ProgrammingError` under `--concurrency` | `check_same_thread=False` |
+| HIGH-2 | `requests.Session` not thread-safe across workers | Per-worker session in concurrent mode |
+| HIGH-3 | Disk full leaves corrupt `.PDF` files marked as downloaded | Atomic `.part` write + propagate `OSError` |
+| HIGH-4 | CDN HTML error pages saved as valid `.PDF` | Validate `%PDF-` magic bytes before writing |
+| HIGH-5 | Duplicate filenames silently overwrite each other | `announcement_id` prefix in filename |
+
+The disk-full issue (HIGH-3) was discovered during the large test run when 5.5 GB of annual reports exhausted local disk space. The fix ensures partial writes are cleaned up and the error propagates instead of being silently swallowed.
 
 ### Complexity comparison across all 3 projects
 
@@ -262,5 +277,43 @@ Full month test (31 date ranges, --max-pages 20, --download):
 | Download URLs | 3-step enc token chain | Session-bound, expire on paginate | **Permanent CDN URLs** |
 | Pagination | Complex callback format | Sequential only | **Random-access page numbers** |
 | Dependencies | 5 | 5 | **1** (just requests) |
-| Lines of code | 1,188 | 765 | **~500** |
+| Lines of code | 1,188 | 765 | **~550** |
 | Difficulty | Hard | Very Hard | **Easy** |
+
+## Production Status (2026-04-13)
+
+**Status: PRODUCTION READY**
+
+Repo: https://github.com/itisaevalex/ChinaCninfoScraper
+
+Sibling projects:
+- Canada: https://github.com/itisaevalex/SedarPlusScraper
+- Mexico: https://github.com/itisaevalex/MexicanReportsScraperExtended
+- India: separate repo (built in parallel)
+
+### For the team
+
+Quick start:
+```bash
+git clone git@github.com:itisaevalex/ChinaCninfoScraper.git
+cd ChinaCninfoScraper
+pip install -r requirements.txt
+
+# Crawl all annual reports for a date range
+python scraper.py crawl --category annual --date-from 2024-01-01 --date-to 2024-12-31 --download --max-pages 20
+
+# Speed up with concurrent date ranges (4 parallel workers)
+python scraper.py crawl --category annual --date-from 2024-01-01 --date-to 2024-12-31 --download --concurrency 4
+
+# Monitor for new filings in real time
+python scraper.py monitor --interval 300 --download
+
+# Export to JSON
+python scraper.py export --output filings.json
+```
+
+### Known constraints
+- **100-page API cap** — always use `--date-from`/`--date-to` for comprehensive scraping
+- **Disk space** — annual reports are large (avg ~2.5 MB each). A full year can be 10+ GB
+- **Chinese-only** — all titles, company names, and categories are in Simplified Chinese
+- **No official API** — this uses a reverse-engineered internal API that could change without notice
