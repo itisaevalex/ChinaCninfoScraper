@@ -32,7 +32,6 @@ import logging.handlers
 import os
 import random
 import sys
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -366,17 +365,29 @@ def cmd_crawl(args: argparse.Namespace) -> int:
                 concurrency,
             )
 
-            counter_lock = threading.Lock()
-
-            def _crawl_date_range(
+            def _crawl_date_range_worker(
                 idx_dr: tuple[int, str],
-            ) -> tuple[int, int, int]:
-                """Crawl a single date range. Returns (filings, new, downloaded)."""
+                snapshot_ids: frozenset[str],
+            ) -> tuple[int, list[Filing], list[dict]]:
+                """HTTP-only worker: fetch and parse one date range.
+
+                Performs no SQLite operations.  Returns parsed data so the
+                main thread can do all DB writes after the future completes.
+
+                Args:
+                    idx_dr:       (1-based index, date-range string) pair.
+                    snapshot_ids: Frozen snapshot of known IDs at dispatch time.
+                                  Used to filter already-seen filings without
+                                  touching the shared mutable ``known_ids`` set.
+
+                Returns:
+                    (total_count, all_filings, all_filing_dicts) where
+                    all_filings contains only entries not in snapshot_ids.
+                """
                 idx, dr = idx_dr
-                local_session = make_session() if concurrency > 1 else session
-                range_filings = 0
-                range_new = 0
-                range_downloaded = 0
+                local_session = make_session()
+                collected_filings: list[Filing] = []
+                collected_dicts: list[dict] = []
 
                 resp = query_announcements(
                     local_session,
@@ -386,38 +397,20 @@ def cmd_crawl(args: argparse.Namespace) -> int:
                     date_range=dr,
                     search_key=args.search or "",
                 )
-                filings = parse_announcements(resp)
+                page1_filings = parse_announcements(resp)
                 total_count, total_pages, _ = get_pagination_info(resp)
 
-                if not filings:
-                    return (0, 0, 0)
+                if not page1_filings:
+                    return (0, [], [])
 
-                # Filter already-known IDs when resuming
-                if known_ids:
-                    filings = [f for f in filings if f.announcement_id not in known_ids]
+                if snapshot_ids:
+                    page1_filings = [
+                        f for f in page1_filings
+                        if f.filing_id not in snapshot_ids
+                    ]
 
-                if filings:
-                    with counter_lock:
-                        filing_dicts = [f.__dict__ for f in filings]
-                        new = insert_batch(conn, filings)
-                        for f in filings:
-                            known_ids.add(f.announcement_id)
-                    range_filings += len(filings)
-                    range_new += new
-                    log.info(
-                        "Range %d/%d [%s]: page 1/%d — %d filings (%d new), "
-                        "%d total in range",
-                        idx,
-                        len(all_ranges),
-                        dr,
-                        total_pages,
-                        len(filings),
-                        new,
-                        total_count,
-                    )
-                    if args.download:
-                        dl = batch_download(conn, filing_dicts, args.doc_dir, args.parallel)
-                        range_downloaded += dl
+                collected_filings.extend(page1_filings)
+                collected_dicts.extend([f.__dict__ for f in page1_filings])
 
                 pages_to_fetch = min(total_pages, args.max_pages)
                 for page_num in range(2, pages_to_fetch + 1):
@@ -434,57 +427,102 @@ def cmd_crawl(args: argparse.Namespace) -> int:
                     if not page_filings:
                         break
 
-                    if known_ids:
+                    if snapshot_ids:
                         page_filings = [
                             f for f in page_filings
-                            if f.announcement_id not in known_ids
+                            if f.filing_id not in snapshot_ids
                         ]
 
-                    if page_filings:
-                        with counter_lock:
-                            filing_dicts = [f.__dict__ for f in page_filings]
-                            new = insert_batch(conn, page_filings)
-                            for f in page_filings:
-                                known_ids.add(f.announcement_id)
-                        range_filings += len(page_filings)
-                        range_new += new
-                        log.info(
-                            "  [%s] Page %d/%d — %d filings (%d new)",
-                            dr,
-                            page_num,
-                            pages_to_fetch,
-                            len(page_filings),
-                            new,
-                        )
-                        if args.download:
-                            dl = batch_download(
-                                conn, filing_dicts, args.doc_dir, args.parallel
-                            )
-                            range_downloaded += dl
+                    collected_filings.extend(page_filings)
+                    collected_dicts.extend([f.__dict__ for f in page_filings])
 
-                return (range_filings, range_new, range_downloaded)
+                return (total_count, collected_filings, collected_dicts)
 
             if concurrency > 1:
                 with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    # Snapshot known_ids at dispatch time so workers get an
+                    # immutable view; the main thread updates the live set below.
                     futs = {
-                        pool.submit(_crawl_date_range, idx_dr): idx_dr
+                        pool.submit(
+                            _crawl_date_range_worker,
+                            idx_dr,
+                            frozenset(known_ids),
+                        ): idx_dr
                         for idx_dr in enumerate(all_ranges, 1)
                     }
                     for fut in as_completed(futs):
+                        idx_dr = futs[fut]
                         try:
-                            r_f, r_n, r_d = fut.result()
-                            total_filings += r_f
-                            total_new += r_n
-                            total_downloaded += r_d
+                            total_count, range_filings, filing_dicts = fut.result()
                         except Exception as exc:
-                            log.error("Date range %s failed: %s", futs[fut], exc)
+                            log.error("Date range %s failed: %s", idx_dr, exc)
                             error_count += 1
+                            continue
+
+                        if not range_filings:
+                            continue
+
+                        # All DB writes on the main thread — spec compliance.
+                        new = insert_batch(conn, range_filings)
+                        for f in range_filings:
+                            known_ids.add(f.filing_id)
+
+                        idx, dr = idx_dr
+                        total_filings += len(range_filings)
+                        total_new += new
+                        log.info(
+                            "Range %d/%d [%s]: %d filings (%d new), "
+                            "%d total in range",
+                            idx,
+                            len(all_ranges),
+                            dr,
+                            len(range_filings),
+                            new,
+                            total_count,
+                        )
+                        if args.download and filing_dicts:
+                            dl = batch_download(
+                                conn, filing_dicts, args.doc_dir, args.parallel
+                            )
+                            total_downloaded += dl
             else:
                 for idx_dr in enumerate(all_ranges, 1):
-                    r_f, r_n, r_d = _crawl_date_range(idx_dr)
-                    total_filings += r_f
-                    total_new += r_n
-                    total_downloaded += r_d
+                    idx, dr = idx_dr
+                    try:
+                        total_count, range_filings, filing_dicts = (
+                            _crawl_date_range_worker(idx_dr, frozenset(known_ids))
+                        )
+                    except Exception as exc:
+                        log.error("Date range %s failed: %s", idx_dr, exc)
+                        error_count += 1
+                        _polite_delay()
+                        continue
+
+                    if not range_filings:
+                        _polite_delay()
+                        continue
+
+                    new = insert_batch(conn, range_filings)
+                    for f in range_filings:
+                        known_ids.add(f.filing_id)
+
+                    total_filings += len(range_filings)
+                    total_new += new
+                    log.info(
+                        "Range %d/%d [%s]: %d filings (%d new), "
+                        "%d total in range",
+                        idx,
+                        len(all_ranges),
+                        dr,
+                        len(range_filings),
+                        new,
+                        total_count,
+                    )
+                    if args.download and filing_dicts:
+                        dl = batch_download(
+                            conn, filing_dicts, args.doc_dir, args.parallel
+                        )
+                        total_downloaded += dl
                     _polite_delay()
 
         else:
@@ -630,7 +668,7 @@ def cmd_monitor(args: argparse.Namespace) -> None:
                 sort_type="desc",
             )
             filings = parse_announcements(resp)
-            new_filings = [f for f in filings if f.announcement_id not in known_ids]
+            new_filings = [f for f in filings if f.filing_id not in known_ids]
 
             if new_filings:
                 all_new = list(new_filings)
@@ -638,7 +676,7 @@ def cmd_monitor(args: argparse.Namespace) -> None:
 
                 insert_batch(conn, new_filings)
                 for f in new_filings:
-                    known_ids.add(f.announcement_id)
+                    known_ids.add(f.filing_id)
 
                 if args.download and new_filings:
                     dl = batch_download(
@@ -667,7 +705,7 @@ def cmd_monitor(args: argparse.Namespace) -> None:
 
                     page_new = [
                         f for f in page_filings
-                        if f.announcement_id not in known_ids
+                        if f.filing_id not in known_ids
                     ]
                     if not page_new:
                         log.info("  Page %d: 0 new — caught up.", page_num)
@@ -676,7 +714,7 @@ def cmd_monitor(args: argparse.Namespace) -> None:
                     all_new.extend(page_new)
                     insert_batch(conn, page_new)
                     for f in page_new:
-                        known_ids.add(f.announcement_id)
+                        known_ids.add(f.filing_id)
 
                     log.info("  Page %d: %d new filings", page_num, len(page_new))
 
