@@ -1,0 +1,113 @@
+"""
+conftest.py — shared pytest fixtures for the CNINFO scraper test suite.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+# ---------------------------------------------------------------------------
+# JSON fixture loaders
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def cninfo_query_response() -> dict:
+    """Real-world-style CNINFO API response with 2 filings."""
+    path = FIXTURES_DIR / "cninfo_query_response.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.fixture(scope="session")
+def cninfo_empty_response() -> dict:
+    """CNINFO API response with zero results (null announcements)."""
+    path = FIXTURES_DIR / "cninfo_empty_response.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.fixture(scope="session")
+def cninfo_multi_type_response() -> dict:
+    """CNINFO API response with one filing per major type + no-url entry."""
+    path = FIXTURES_DIR / "cninfo_multi_type_response.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# In-memory database
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mem_db() -> sqlite3.Connection:
+    """Fresh in-memory SQLite connection with the full CNINFO schema applied."""
+    import sys
+    import os
+    # Ensure the china-scraper root is on sys.path
+    root = str(Path(__file__).parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+    from db import get_db
+
+    conn = get_db(db_path=":memory:")
+    yield conn
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Sample Filing dataclass
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def sample_filing():
+    """A valid Filing dataclass instance for DB tests."""
+    from db import Filing
+
+    return Filing(
+        announcement_id="1219488813",
+        sec_code="000001",
+        sec_name="平安银行",
+        org_id="gssz0000001",
+        org_name="平安银行股份有限公司",
+        title="平安银行股份有限公司2023年年度报告",
+        announcement_date="2024-03-30",
+        announcement_time_ms=1711728000000,
+        adjunct_url="finalpage/2024-03-30/1219488813.PDF",
+        adjunct_type="PDF",
+        adjunct_size=8543,
+        announcement_type="category_ndbg_szsh",
+        column_id="col_szse_annual",
+        download_url="http://static.cninfo.com.cn/finalpage/2024-03-30/1219488813.PDF",
+        filing_type="annual_report",
+    )
+
+
+@pytest.fixture
+def sample_filing_2():
+    """A second distinct Filing dataclass instance for batch/dedup tests."""
+    from db import Filing
+
+    return Filing(
+        announcement_id="2300145722",
+        sec_code="600519",
+        sec_name="贵州茅台",
+        org_id="gssh0600519",
+        org_name="贵州茅台酒股份有限公司",
+        title="贵州茅台酒股份有限公司2023年半年度报告",
+        announcement_date="2023-08-15",
+        announcement_time_ms=1692057600000,
+        adjunct_url="finalpage/2023-08-15/2300145722.PDF",
+        adjunct_type="PDF",
+        adjunct_size=6100,
+        announcement_type="category_bndbg_szsh",
+        column_id="col_sse_semi",
+        download_url="http://static.cninfo.com.cn/finalpage/2023-08-15/2300145722.PDF",
+        filing_type="half_yearly",
+    )

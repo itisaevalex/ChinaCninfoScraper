@@ -1,0 +1,35 @@
+{
+  "totalAnnouncement": 2,
+  "totalpages": 1,
+  "hasMore": false,
+  "announcements": [
+    {
+      "announcementId": "1219488813",
+      "secCode": "000001",
+      "secName": "平安银行",
+      "orgId": "gssz0000001",
+      "orgName": "平安银行股份有限公司",
+      "announcementTitle": "平安银行股份有限公司2023年年度报告",
+      "announcementTime": 1711728000000,
+      "adjunctUrl": "finalpage/2024-03-30/1219488813.PDF",
+      "adjunctType": "PDF",
+      "adjunctSize": 8543,
+      "announcementType": "category_ndbg_szsh",
+      "columnId": "col_szse_annual"
+    },
+    {
+      "announcementId": "2300145722",
+      "secCode": "600519",
+      "secName": "贵州茅台",
+      "orgId": "gssh0600519",
+      "orgName": "贵州茅台酒股份有限公司",
+      "announcementTitle": "贵州茅台酒股份有限公司2023年半年度报告",
+      "announcementTime": 1692057600000,
+      "adjunctUrl": "finalpage/2023-08-15/2300145722.PDF",
+      "adjunctType": "PDF",
+      "adjunctSize": 6100,
+      "announcementType": "category_bndbg_szsh",
+      "columnId": "col_sse_semi"
+    }
+  ]
+}

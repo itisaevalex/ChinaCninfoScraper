@@ -16,6 +16,8 @@ Usage:
   python scraper.py crawl --max-pages 10
   python scraper.py crawl --max-pages 50 --download
   python scraper.py crawl --category annual --date-from 2024-01-01 --date-to 2024-12-31
+  python scraper.py crawl --date-from 2024-01-01 --date-to 2024-03-31 --incremental
+  python scraper.py crawl --date-from 2024-01-01 --date-to 2024-03-31 --resume
   python scraper.py monitor --interval 300 --download
   python scraper.py export --output filings.json
   python scraper.py stats
@@ -24,12 +26,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
+import logging.handlers
 import os
 import random
-import re
-import sqlite3
 import sys
 import threading
 import time
@@ -39,40 +39,35 @@ from typing import Any
 
 import requests
 
+from db import (
+    DB_FILE,
+    CrawlResult,
+    export_json,
+    get_db,
+    get_known_ids,
+    get_last_crawl_date,
+    insert_batch,
+    stats,
+)
+from downloader import batch_download
+from http_utils import make_session, safe_post
+from parsers import get_pagination_info, parse_announcements
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-BASE_URL = "http://www.cninfo.com.cn"
-STATIC_URL = "http://static.cninfo.com.cn"
-QUERY_URL = f"{BASE_URL}/new/hisAnnouncement/query"
-STOCK_LIST_URL = f"{BASE_URL}/new/data/szse_stock.json"
+QUERY_URL = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
+STOCK_LIST_URL = "http://www.cninfo.com.cn/new/data/szse_stock.json"
 
-DB_FILE = "filings_cache.db"
-PAGE_SIZE = 30  # Server-enforced max
-MAX_API_PAGES = 100  # CNINFO silently caps at ~100 pages
+PAGE_SIZE = 30        # Server-enforced maximum
+MAX_API_PAGES = 100   # CNINFO silently caps at ~100 pages
 
 DELAY_BETWEEN_PAGES = 1.0
-DELAY_BETWEEN_DOWNLOADS = 0.3
-DELAY_JITTER = 0.5  # Random jitter added to delays
+DELAY_JITTER = 0.5
 
-REQUEST_HEADERS = {
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Accept-Encoding": "gzip, deflate",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "Host": "www.cninfo.com.cn",
-    "Origin": "http://www.cninfo.com.cn",
-    "Referer": "http://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search",
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "X-Requested-With": "XMLHttpRequest",
-}
-
-# Filing category codes
-CATEGORIES = {
+# Filing category codes (API parameter values)
+CATEGORIES: dict[str, str] = {
     "annual": "category_ndbg_szsh",
     "semi_annual": "category_bndbg_szsh",
     "q1": "category_yjdbg_szsh",
@@ -91,60 +86,86 @@ CATEGORIES = {
     "delisting": "category_tbclts_szsh",
 }
 
-# Exchange/column codes
-COLUMNS = {
-    "all": "szse",       # Combined: Shenzhen + Shanghai + Beijing
+# Exchange / column codes
+COLUMNS: dict[str, str] = {
+    "all": "szse",
     "shanghai": "sse",
     "hongkong": "hke",
     "third_board": "third",
 }
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
 log = logging.getLogger("cninfo")
 
 
 # ---------------------------------------------------------------------------
-# API Client
+# Logging setup
 # ---------------------------------------------------------------------------
 
 
-def create_session() -> requests.Session:
-    """Create a requests session with retry adapter."""
-    session = requests.Session()
-    session.headers.update(REQUEST_HEADERS)
+def _configure_logging(log_file: str | None) -> None:
+    """Configure root and cninfo loggers.
 
-    adapter = requests.adapters.HTTPAdapter(
-        max_retries=requests.adapters.Retry(
-            total=3,
-            backoff_factor=1.0,
-            status_forcelist=[429, 500, 502, 503, 504],
-        ),
-        pool_maxsize=10,
+    Always writes to stderr. Optionally also writes to a rotating file.
+
+    Args:
+        log_file: Path for an optional rotating log file, or None.
+    """
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
     )
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
 
-    return session
+    if not root.handlers:
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setFormatter(fmt)
+        root.addHandler(stderr_handler)
+
+    if log_file:
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=10 * 1024 * 1024,  # 10 MB
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
+        log.info("Logging to file: %s", log_file)
 
 
-def query_announcements(
-    session: requests.Session,
-    page_num: int = 1,
-    stock: str = "",
-    category: str = "",
-    column: str = "szse",
-    plate: str = "",
-    search_key: str = "",
-    date_range: str = "",
+# ---------------------------------------------------------------------------
+# API helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_query_data(
+    page_num: int,
+    category: str,
+    column: str,
+    date_range: str,
+    search_key: str,
     sort_name: str = "",
     sort_type: str = "",
+    plate: str = "",
+    stock: str = "",
 ) -> dict[str, Any]:
-    """Query the CNINFO announcement API. Returns parsed JSON response."""
-    data = {
+    """Build the form-encoded POST body for the CNINFO query endpoint.
+
+    Args:
+        page_num:   1-based page number.
+        category:   Filing category code (empty string = all categories).
+        column:     Exchange code (e.g. "szse", "sse").
+        date_range: Date range string "YYYY-MM-DD~YYYY-MM-DD" or "".
+        search_key: Keyword search string.
+        sort_name:  Sort field name (e.g. "time").
+        sort_type:  Sort direction (e.g. "desc").
+        plate:      Optional plate filter.
+        stock:      Optional stock code filter.
+
+    Returns:
+        Dict suitable for requests.post(data=...).
+    """
+    return {
         "pageNum": page_num,
         "pageSize": PAGE_SIZE,
         "column": column,
@@ -161,344 +182,127 @@ def query_announcements(
         "isHLtitle": "false",
     }
 
-    resp = session.post(QUERY_URL, data=data, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
 
+def query_announcements(
+    session: requests.Session,
+    page_num: int = 1,
+    stock: str = "",
+    category: str = "",
+    column: str = "szse",
+    plate: str = "",
+    search_key: str = "",
+    date_range: str = "",
+    sort_name: str = "",
+    sort_type: str = "",
+) -> dict[str, Any]:
+    """Query the CNINFO announcement API. Returns parsed JSON response.
 
-def fetch_stock_list(session: requests.Session) -> list[dict]:
-    """Fetch the full stock list with orgId mappings."""
-    resp = session.get(STOCK_LIST_URL, timeout=30)
-    resp.raise_for_status()
-    return resp.json().get("stockList", [])
+    Raises ValueError if the API returns None (all retries failed).
 
+    Args:
+        session:    requests.Session from make_session().
+        page_num:   Page number (1-based).
+        stock:      Optional stock code filter.
+        category:   Filing category code.
+        column:     Exchange column code.
+        plate:      Plate filter.
+        search_key: Keyword search string.
+        date_range: Date range "YYYY-MM-DD~YYYY-MM-DD".
+        sort_name:  Sort field.
+        sort_type:  Sort direction.
 
-# ---------------------------------------------------------------------------
-# Filing Parsing
-# ---------------------------------------------------------------------------
+    Returns:
+        Parsed JSON response dict.
 
-
-def parse_announcements(api_response: dict) -> list[dict[str, Any]]:
-    """Extract normalized filing dicts from API response."""
-    announcements = api_response.get("announcements") or []
-    filings = []
-
-    for ann in announcements:
-        adjunct_url = ann.get("adjunctUrl", "")
-        if not adjunct_url:
-            continue
-
-        # announcementTime is milliseconds since epoch
-        ts_ms = ann.get("announcementTime", 0)
-        announcement_date = ""
-        if ts_ms:
-            announcement_date = datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d")
-
-        # Clean title: remove <em> highlight tags if present
-        title = ann.get("announcementTitle", "")
-        title = re.sub(r"</?em>", "", title)
-
-        filing = {
-            "sec_code": ann.get("secCode", ""),
-            "sec_name": ann.get("secName", ""),
-            "org_id": ann.get("orgId", ""),
-            "org_name": ann.get("orgName", ""),
-            "announcement_id": ann.get("announcementId", ""),
-            "title": title,
-            "announcement_date": announcement_date,
-            "announcement_time_ms": ts_ms,
-            "adjunct_url": adjunct_url,
-            "adjunct_type": ann.get("adjunctType", "PDF"),
-            "adjunct_size": ann.get("adjunctSize", 0),
-            "announcement_type": ann.get("announcementType", ""),
-            "column_id": ann.get("columnId", ""),
-            "download_url": f"{STATIC_URL}/{adjunct_url}",
-        }
-        filings.append(filing)
-
-    return filings
-
-
-def get_pagination_info(api_response: dict) -> tuple[int, int, bool]:
-    """Extract pagination info: (total_announcements, total_pages, has_more)."""
-    total = api_response.get("totalAnnouncement", 0)
-    pages = api_response.get("totalpages", 0)
-    has_more = api_response.get("hasMore", False)
-    return total, pages, has_more
+    Raises:
+        ValueError: If safe_post returns None after all retries.
+    """
+    data = _build_query_data(
+        page_num=page_num,
+        category=category,
+        column=column,
+        date_range=date_range,
+        search_key=search_key,
+        sort_name=sort_name,
+        sort_type=sort_type,
+        plate=plate,
+        stock=stock,
+    )
+    result = safe_post(session, QUERY_URL, data)
+    if result is None:
+        raise ValueError(f"API request failed for page {page_num}, date_range={date_range!r}")
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Date Range Splitting (bypass 100-page cap)
+# Date range splitting (bypass 100-page cap)
 # ---------------------------------------------------------------------------
 
 
 def generate_date_ranges(
-    date_from: str, date_to: str, interval_days: int = 1
+    date_from: str,
+    date_to: str,
+    interval_days: int = 1,
 ) -> list[str]:
-    """Generate date range strings for splitting large queries.
+    """Split a date span into smaller query ranges to stay under the API cap.
 
-    CNINFO caps results at ~100 pages. Splitting into smaller date
-    ranges ensures we get all results.
+    CNINFO caps results at ~100 pages (3,000 filings) per query. Splitting
+    the date range into daily windows ensures all filings are captured.
 
-    Returns list of "YYYY-MM-DD~YYYY-MM-DD" strings.
+    Args:
+        date_from:     Start date "YYYY-MM-DD".
+        date_to:       End date "YYYY-MM-DD" (inclusive).
+        interval_days: Window size in days (default 1 = daily splits).
+
+    Returns:
+        List of "YYYY-MM-DD~YYYY-MM-DD" range strings.
     """
     start = datetime.strptime(date_from, "%Y-%m-%d")
     end = datetime.strptime(date_to, "%Y-%m-%d")
-    ranges = []
+    ranges: list[str] = []
 
     current = start
     while current <= end:
         range_end = min(current + timedelta(days=interval_days - 1), end)
-        ranges.append(f"{current.strftime('%Y-%m-%d')}~{range_end.strftime('%Y-%m-%d')}")
+        ranges.append(
+            f"{current.strftime('%Y-%m-%d')}~{range_end.strftime('%Y-%m-%d')}"
+        )
         current = range_end + timedelta(days=1)
 
     return ranges
 
 
-# ---------------------------------------------------------------------------
-# Download
-# ---------------------------------------------------------------------------
-
-
-DOWNLOAD_HEADERS = {
-    "Accept": "application/pdf, application/octet-stream, */*",
-    "Accept-Encoding": "gzip, deflate",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    ),
-}
-
-
-def download_filings(
-    session: requests.Session,
-    filings: list[dict],
-    doc_dir: str,
-    cache: FilingCache,
-    parallel: int = 5,
-) -> int:
-    """Download documents for a list of filings. Returns count downloaded."""
-    to_download = [
-        f for f in filings
-        if f.get("download_url") and not cache.is_downloaded(f["announcement_id"])
-    ]
-    if not to_download:
-        return 0
-
-    results: list[tuple[str, str]] = []  # (announcement_id, filepath) pairs
-
-    def _download_one(filing: dict) -> tuple[str, str] | None:
-        url = filing["download_url"]
-        ann_id = filing["announcement_id"]
-        try:
-            # Use clean headers for static CDN — API headers cause 404
-            resp = requests.get(url, headers=DOWNLOAD_HEADERS, timeout=120)
-            if resp.status_code != 200:
-                log.warning("Download failed (%d): %s", resp.status_code, url)
-                return None
-
-            # HIGH-4 fix: validate content is actually a PDF, not an error page
-            content = resp.content
-            if not content.startswith(b"%PDF"):
-                log.warning(
-                    "Not a PDF (got %r...): %s", content[:30], url,
-                )
-                return None
-
-            # Build filename with announcement_id to prevent collisions (HIGH-5)
-            sec_code = filing.get("sec_code", "unknown")
-            title = filing.get("title", "doc")
-            ext = filing.get("adjunct_type", "PDF").upper()
-
-            safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', title)
-            safe_title = safe_title.replace("*", "＊")[:70]
-            filename = f"{sec_code}_{ann_id[:8]}_{safe_title}.{ext}"
-
-            # HIGH-3 fix: atomic write via temp file, propagate disk errors
-            filepath = os.path.join(doc_dir, filename)
-            part_path = filepath + ".part"
-            try:
-                with open(part_path, "wb") as fh:
-                    fh.write(content)
-                os.replace(part_path, filepath)
-            except OSError as e:
-                log.error("Disk write failed (%s). Aborting.", e)
-                try:
-                    os.unlink(part_path)
-                except OSError:
-                    pass
-                raise
-
-            time.sleep(DELAY_BETWEEN_DOWNLOADS + random.uniform(0, DELAY_JITTER))
-            return (ann_id, filepath)
-        except requests.RequestException as e:
-            log.warning("Network error for %s: %s", ann_id, e)
-            return None
-
-    if parallel > 1 and len(to_download) > 1:
-        with ThreadPoolExecutor(max_workers=min(parallel, len(to_download))) as pool:
-            futs = {pool.submit(_download_one, f): f for f in to_download}
-            for fut in as_completed(futs):
-                result = fut.result()
-                if result:
-                    results.append(result)
-    else:
-        for f in to_download:
-            result = _download_one(f)
-            if result:
-                results.append(result)
-
-    # Update cache from main thread (SQLite thread safety)
-    for ann_id, path in results:
-        cache.mark_downloaded(ann_id, path)
-
-    return len(results)
-
-
-# ---------------------------------------------------------------------------
-# SQLite Cache
-# ---------------------------------------------------------------------------
-
-
-class FilingCache:
-    def __init__(self, db_path: str = DB_FILE):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.executescript("""
-            CREATE TABLE IF NOT EXISTS filings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                announcement_id TEXT UNIQUE,
-                sec_code TEXT,
-                sec_name TEXT,
-                org_id TEXT,
-                org_name TEXT,
-                title TEXT,
-                announcement_date TEXT,
-                announcement_time_ms INTEGER,
-                adjunct_url TEXT,
-                adjunct_type TEXT,
-                adjunct_size INTEGER,
-                announcement_type TEXT,
-                column_id TEXT,
-                download_url TEXT,
-                downloaded INTEGER DEFAULT 0,
-                local_path TEXT,
-                first_seen TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_ann_id ON filings(announcement_id);
-            CREATE INDEX IF NOT EXISTS idx_dl ON filings(downloaded);
-            CREATE INDEX IF NOT EXISTS idx_date ON filings(announcement_date);
-            CREATE INDEX IF NOT EXISTS idx_sec_code ON filings(sec_code);
-        """)
-        self.conn.commit()
-
-    def insert_batch(self, filings: list[dict]) -> int:
-        """Insert filings, ignoring duplicates. Returns count of new rows."""
-        before = self.conn.execute("SELECT COUNT(*) FROM filings").fetchone()[0]
-        now = datetime.now().isoformat()
-        for f in filings:
-            ann_id = f.get("announcement_id", "")
-            if not ann_id:
-                continue
-            self.conn.execute(
-                """INSERT OR IGNORE INTO filings
-                   (announcement_id, sec_code, sec_name, org_id, org_name,
-                    title, announcement_date, announcement_time_ms,
-                    adjunct_url, adjunct_type, adjunct_size,
-                    announcement_type, column_id, download_url, first_seen)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    ann_id, f.get("sec_code", ""), f.get("sec_name", ""),
-                    f.get("org_id", ""), f.get("org_name", ""),
-                    f.get("title", ""), f.get("announcement_date", ""),
-                    f.get("announcement_time_ms", 0),
-                    f.get("adjunct_url", ""), f.get("adjunct_type", ""),
-                    f.get("adjunct_size", 0),
-                    f.get("announcement_type", ""), f.get("column_id", ""),
-                    f.get("download_url", ""), now,
-                ),
-            )
-        self.conn.commit()
-        return self.conn.execute("SELECT COUNT(*) FROM filings").fetchone()[0] - before
-
-    def mark_downloaded(self, announcement_id: str, path: str):
-        self.conn.execute(
-            "UPDATE filings SET downloaded=1, local_path=? WHERE announcement_id=?",
-            (path, announcement_id),
-        )
-        self.conn.commit()
-
-    def is_downloaded(self, announcement_id: str) -> bool:
-        row = self.conn.execute(
-            "SELECT downloaded FROM filings WHERE announcement_id=?",
-            (announcement_id,),
-        ).fetchone()
-        return bool(row and row[0])
-
-    def get_known_ids(self) -> set[str]:
-        return {
-            r[0]
-            for r in self.conn.execute("SELECT announcement_id FROM filings").fetchall()
-        }
-
-    def stats(self) -> dict:
-        r = self.conn.execute(
-            """SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN downloaded=1 THEN 1 ELSE 0 END) as downloaded,
-                SUM(CASE WHEN downloaded=0 THEN 1 ELSE 0 END) as pending,
-                COUNT(DISTINCT sec_code) as unique_companies,
-                MIN(announcement_date) as oldest,
-                MAX(announcement_date) as newest
-            FROM filings"""
-        ).fetchone()
-        return dict(r)
-
-    def export_json(self, path: str):
-        rows = self.conn.execute(
-            "SELECT * FROM filings ORDER BY announcement_date DESC"
-        ).fetchall()
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "metadata": {
-                        "source": BASE_URL,
-                        "exported_at": datetime.now().isoformat(),
-                        "total": len(rows),
-                        "stats": self.stats(),
-                    },
-                    "filings": [dict(r) for r in rows],
-                },
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-        log.info("Exported %d filings to %s", len(rows), path)
-
-    def close(self):
-        self.conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
-
-
-def _polite_delay():
-    """Sleep with jitter to be polite to the server."""
+def _polite_delay() -> None:
+    """Sleep with jitter between page requests."""
     time.sleep(DELAY_BETWEEN_PAGES + random.uniform(0, DELAY_JITTER))
 
 
-def cmd_crawl(args):
-    session = create_session()
-    cache = FilingCache(args.db)
+# ---------------------------------------------------------------------------
+# Crawl command
+# ---------------------------------------------------------------------------
+
+
+def cmd_crawl(args: argparse.Namespace) -> None:
+    """Crawl CNINFO filings with optional date-range splitting."""
+    conn = get_db(args.db)
+    session = make_session()
+
     if args.download:
         os.makedirs(args.doc_dir, exist_ok=True)
 
-    # Build query parameters
     category = CATEGORIES.get(args.category, args.category) if args.category else ""
     column = COLUMNS.get(args.column, args.column)
+
+    # --incremental: skip date ranges already covered in the cache
+    incremental_cutoff: str | None = None
+    if getattr(args, "incremental", False):
+        incremental_cutoff = get_last_crawl_date(conn)
+        if incremental_cutoff:
+            log.info(
+                "--incremental: cache has data through %s. "
+                "Skipping date ranges on or before this date.",
+                incremental_cutoff,
+            )
 
     t_start = time.time()
     total_filings = 0
@@ -506,176 +310,270 @@ def cmd_crawl(args):
     total_downloaded = 0
 
     try:
+        if args.date_from and args.date_to:
+            all_ranges = generate_date_ranges(args.date_from, args.date_to)
 
-      # Determine if we need date-range splitting
-      if args.date_from and args.date_to:
-        date_ranges = generate_date_ranges(args.date_from, args.date_to)
-        concurrency = getattr(args, "concurrency", 1) or 1
-        log.info(
-            "Crawling %d date ranges (%s to %s), category=%s, column=%s, concurrency=%d",
-            len(date_ranges), args.date_from, args.date_to,
-            args.category or "all", args.column, concurrency,
-        )
+            # --incremental: drop ranges already seen
+            if incremental_cutoff:
+                all_ranges = [
+                    dr for dr in all_ranges
+                    if dr.split("~")[0] > incremental_cutoff
+                ]
+                if not all_ranges:
+                    log.info(
+                        "--incremental: all date ranges already in cache. Nothing to do."
+                    )
+                    return
 
-        # Lock for thread-safe SQLite and counter updates
-        counter_lock = threading.Lock()
+            # --resume: load already-seen IDs to detect genuinely new items
+            known_ids: set[str] = set()
+            if getattr(args, "resume", False):
+                known_ids = get_known_ids(conn)
+                log.info(
+                    "--resume: %d known IDs loaded. Will skip already-crawled filings.",
+                    len(known_ids),
+                )
 
-        def _crawl_date_range(idx_dr: tuple[int, str]) -> tuple[int, int, int]:
-            """Crawl a single date range. Returns (filings, new, downloaded)."""
-            idx, dr = idx_dr
-            # HIGH-2 fix: each worker gets its own session (requests.Session is not thread-safe)
-            local_session = create_session() if concurrency > 1 else session
-            range_filings = 0
-            range_new = 0
-            range_downloaded = 0
-
-            resp = query_announcements(
-                local_session, page_num=1, category=category,
-                column=column, date_range=dr,
-                search_key=args.search or "",
-            )
-            filings = parse_announcements(resp)
-            total_count, total_pages, _ = get_pagination_info(resp)
-
-            if not filings:
-                return (0, 0, 0)
-
-            with counter_lock:
-                new = cache.insert_batch(filings)
-            range_filings += len(filings)
-            range_new += new
+            concurrency = getattr(args, "concurrency", 1) or 1
             log.info(
-                "Range %d/%d [%s]: page 1/%d — %d filings (%d new), %d total in range",
-                idx, len(date_ranges), dr, total_pages, len(filings), new, total_count,
+                "Crawling %d date ranges (%s to %s), category=%s, column=%s, "
+                "concurrency=%d",
+                len(all_ranges),
+                args.date_from,
+                args.date_to,
+                args.category or "all",
+                args.column,
+                concurrency,
             )
 
-            if args.download and filings:
-                dl = download_filings(local_session, filings, args.doc_dir, cache, args.parallel)
-                range_downloaded += dl
+            counter_lock = threading.Lock()
 
-            # Paginate within this date range
-            pages_to_fetch = min(total_pages, args.max_pages)
-            for page_num in range(2, pages_to_fetch + 1):
-                _polite_delay()
+            def _crawl_date_range(
+                idx_dr: tuple[int, str],
+            ) -> tuple[int, int, int]:
+                """Crawl a single date range. Returns (filings, new, downloaded)."""
+                idx, dr = idx_dr
+                local_session = make_session() if concurrency > 1 else session
+                range_filings = 0
+                range_new = 0
+                range_downloaded = 0
+
                 resp = query_announcements(
-                    local_session, page_num=page_num, category=category,
-                    column=column, date_range=dr,
+                    local_session,
+                    page_num=1,
+                    category=category,
+                    column=column,
+                    date_range=dr,
                     search_key=args.search or "",
                 )
                 filings = parse_announcements(resp)
+                total_count, total_pages, _ = get_pagination_info(resp)
+
                 if not filings:
-                    break
+                    return (0, 0, 0)
 
-                with counter_lock:
-                    new = cache.insert_batch(filings)
-                range_filings += len(filings)
-                range_new += new
-                log.info(
-                    "  [%s] Page %d/%d — %d filings (%d new)",
-                    dr, page_num, pages_to_fetch, len(filings), new,
-                )
+                # Filter already-known IDs when resuming
+                if known_ids:
+                    filings = [f for f in filings if f.announcement_id not in known_ids]
 
-                if args.download and filings:
-                    dl = download_filings(local_session, filings, args.doc_dir, cache, args.parallel)
-                    range_downloaded += dl
-
-            return (range_filings, range_new, range_downloaded)
-
-        # MEDIUM-1 fix: use as_completed with error handling instead of pool.map
-        if concurrency > 1:
-            with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                futs = {
-                    pool.submit(_crawl_date_range, idx_dr): idx_dr
-                    for idx_dr in enumerate(date_ranges, 1)
-                }
-                for fut in as_completed(futs):
-                    try:
-                        r_filings, r_new, r_dl = fut.result()
-                        total_filings += r_filings
-                        total_new += r_new
-                        total_downloaded += r_dl
-                    except Exception as exc:
-                        log.error("Date range %s failed: %s", futs[fut], exc)
-        else:
-            for idx_dr in enumerate(date_ranges, 1):
-                r_filings, r_new, r_dl = _crawl_date_range(idx_dr)
-                total_filings += r_filings
-                total_new += r_new
-                total_downloaded += r_dl
-                _polite_delay()
-
-      else:
-        # No date range — simple paginated crawl
-        date_range = ""
-        if args.date_from:
-            date_range = f"{args.date_from}~"
-        if args.date_to:
-            date_range = f"~{args.date_to}" if not date_range else f"{args.date_from}~{args.date_to}"
-
-        log.info(
-            "Crawling up to %d pages, category=%s, column=%s, date=%s",
-            args.max_pages, args.category or "all", args.column, date_range or "all",
-        )
-
-        for page_num in range(1, args.max_pages + 1):
-            if page_num > 1:
-                _polite_delay()
-
-            resp = query_announcements(
-                session, page_num=page_num, category=category,
-                column=column, date_range=date_range,
-                search_key=args.search or "",
-            )
-            filings = parse_announcements(resp)
-            total_count, total_pages, has_more = get_pagination_info(resp)
-
-            if not filings:
-                log.info("No filings on page %d. Stopping.", page_num)
-                break
-
-            new = cache.insert_batch(filings)
-            total_filings += len(filings)
-            total_new += new
-
-            if page_num == 1:
-                log.info(
-                    "Total available: %d filings across %d pages",
-                    total_count, total_pages,
-                )
-                if total_pages > MAX_API_PAGES:
-                    log.warning(
-                        "Query exceeds %d-page API cap (%d pages). "
-                        "Use --date-from/--date-to to split into date ranges.",
-                        MAX_API_PAGES, total_pages,
+                if filings:
+                    with counter_lock:
+                        filing_dicts = [f.__dict__ for f in filings]
+                        new = insert_batch(conn, filings)
+                        for f in filings:
+                            known_ids.add(f.announcement_id)
+                    range_filings += len(filings)
+                    range_new += new
+                    log.info(
+                        "Range %d/%d [%s]: page 1/%d — %d filings (%d new), "
+                        "%d total in range",
+                        idx,
+                        len(all_ranges),
+                        dr,
+                        total_pages,
+                        len(filings),
+                        new,
+                        total_count,
                     )
+                    if args.download:
+                        dl = batch_download(conn, filing_dicts, args.doc_dir, args.parallel)
+                        range_downloaded += dl
+
+                pages_to_fetch = min(total_pages, args.max_pages)
+                for page_num in range(2, pages_to_fetch + 1):
+                    _polite_delay()
+                    resp = query_announcements(
+                        local_session,
+                        page_num=page_num,
+                        category=category,
+                        column=column,
+                        date_range=dr,
+                        search_key=args.search or "",
+                    )
+                    page_filings = parse_announcements(resp)
+                    if not page_filings:
+                        break
+
+                    if known_ids:
+                        page_filings = [
+                            f for f in page_filings
+                            if f.announcement_id not in known_ids
+                        ]
+
+                    if page_filings:
+                        with counter_lock:
+                            filing_dicts = [f.__dict__ for f in page_filings]
+                            new = insert_batch(conn, page_filings)
+                            for f in page_filings:
+                                known_ids.add(f.announcement_id)
+                        range_filings += len(page_filings)
+                        range_new += new
+                        log.info(
+                            "  [%s] Page %d/%d — %d filings (%d new)",
+                            dr,
+                            page_num,
+                            pages_to_fetch,
+                            len(page_filings),
+                            new,
+                        )
+                        if args.download:
+                            dl = batch_download(
+                                conn, filing_dicts, args.doc_dir, args.parallel
+                            )
+                            range_downloaded += dl
+
+                return (range_filings, range_new, range_downloaded)
+
+            if concurrency > 1:
+                with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    futs = {
+                        pool.submit(_crawl_date_range, idx_dr): idx_dr
+                        for idx_dr in enumerate(all_ranges, 1)
+                    }
+                    for fut in as_completed(futs):
+                        try:
+                            r_f, r_n, r_d = fut.result()
+                            total_filings += r_f
+                            total_new += r_n
+                            total_downloaded += r_d
+                        except Exception as exc:
+                            log.error("Date range %s failed: %s", futs[fut], exc)
+            else:
+                for idx_dr in enumerate(all_ranges, 1):
+                    r_f, r_n, r_d = _crawl_date_range(idx_dr)
+                    total_filings += r_f
+                    total_new += r_n
+                    total_downloaded += r_d
+                    _polite_delay()
+
+        else:
+            # No date range — simple paginated crawl
+            date_range = ""
+            if args.date_from:
+                date_range = f"{args.date_from}~"
+            if args.date_to:
+                if date_range:
+                    date_range = f"{args.date_from}~{args.date_to}"
+                else:
+                    date_range = f"~{args.date_to}"
 
             log.info(
-                "Page %d/%d — %d filings (%d new)",
-                page_num, min(total_pages, args.max_pages), len(filings), new,
+                "Crawling up to %d pages, category=%s, column=%s, date=%s",
+                args.max_pages,
+                args.category or "all",
+                args.column,
+                date_range or "all",
             )
 
-            if args.download and filings:
-                dl = download_filings(session, filings, args.doc_dir, cache, args.parallel)
-                total_downloaded += dl
+            for page_num in range(1, args.max_pages + 1):
+                if page_num > 1:
+                    _polite_delay()
 
-            if not has_more:
-                log.info("No more pages. Stopping.")
-                break
+                resp = query_announcements(
+                    session,
+                    page_num=page_num,
+                    category=category,
+                    column=column,
+                    date_range=date_range,
+                    search_key=args.search or "",
+                )
+                filings = parse_announcements(resp)
+                total_count, total_pages, has_more = get_pagination_info(resp)
 
-      elapsed = time.time() - t_start
-      stats = cache.stats()
-      log.info(
-          "Done: %d filings (%d new), %d downloaded in %.1fs. DB: %d total, %d companies.",
-          total_filings, total_new, total_downloaded, elapsed,
-          stats["total"] or 0, stats["unique_companies"] or 0,
-      )
+                if not filings:
+                    log.info("No filings on page %d. Stopping.", page_num)
+                    break
+
+                filing_dicts = [f.__dict__ for f in filings]
+                new = insert_batch(conn, filings)
+                total_filings += len(filings)
+                total_new += new
+
+                if page_num == 1:
+                    log.info(
+                        "Total available: %d filings across %d pages",
+                        total_count,
+                        total_pages,
+                    )
+                    if total_pages > MAX_API_PAGES:
+                        log.warning(
+                            "Query exceeds %d-page API cap (%d pages). "
+                            "Use --date-from/--date-to to split into date ranges.",
+                            MAX_API_PAGES,
+                            total_pages,
+                        )
+
+                log.info(
+                    "Page %d/%d — %d filings (%d new)",
+                    page_num,
+                    min(total_pages, args.max_pages),
+                    len(filings),
+                    new,
+                )
+
+                if args.download and filing_dicts:
+                    dl = batch_download(
+                        conn, filing_dicts, args.doc_dir, args.parallel
+                    )
+                    total_downloaded += dl
+
+                if not has_more:
+                    log.info("No more pages. Stopping.")
+                    break
+
+        elapsed = time.time() - t_start
+        db_stats = stats(conn)
+        log.info(
+            "Done: %d filings (%d new), %d downloaded in %.1fs. "
+            "DB: %d total, %d companies.",
+            total_filings,
+            total_new,
+            total_downloaded,
+            elapsed,
+            db_stats.get("total") or 0,
+            db_stats.get("unique_companies") or 0,
+        )
+        result = CrawlResult(
+            filings_found=total_filings,
+            filings_new=total_new,
+            filings_downloaded=total_downloaded,
+            elapsed_seconds=elapsed,
+        )
+        return result
+
     finally:
-        cache.close()
+        conn.close()
 
 
-def cmd_monitor(args):
-    cache = FilingCache(args.db)
-    known_ids = cache.get_known_ids()
+# ---------------------------------------------------------------------------
+# Monitor command
+# ---------------------------------------------------------------------------
+
+
+def cmd_monitor(args: argparse.Namespace) -> None:
+    """Watch for new filings on a polling interval."""
+    conn = get_db(args.db)
+    known_ids = get_known_ids(conn)
     if args.download:
         os.makedirs(args.doc_dir, exist_ok=True)
 
@@ -684,10 +582,11 @@ def cmd_monitor(args):
 
     log.info(
         "Monitoring for new filings every %ds. Known: %d. Ctrl+C to stop.",
-        args.interval, len(known_ids),
+        args.interval,
+        len(known_ids),
     )
 
-    session = create_session()
+    session = make_session()
     polls = 0
 
     try:
@@ -695,25 +594,30 @@ def cmd_monitor(args):
             polls += 1
 
             resp = query_announcements(
-                session, page_num=1, category=category, column=column,
-                sort_name="time", sort_type="desc",
+                session,
+                page_num=1,
+                category=category,
+                column=column,
+                sort_name="time",
+                sort_type="desc",
             )
             filings = parse_announcements(resp)
-            new_filings = [f for f in filings if f["announcement_id"] not in known_ids]
+            new_filings = [f for f in filings if f.announcement_id not in known_ids]
 
             if new_filings:
                 all_new = list(new_filings)
-                log.info(
-                    "[Poll %d] NEW: %d filings on page 1.", polls, len(new_filings),
-                )
+                log.info("[Poll %d] NEW: %d filings on page 1.", polls, len(new_filings))
 
-                new_count = cache.insert_batch(new_filings)
+                insert_batch(conn, new_filings)
                 for f in new_filings:
-                    known_ids.add(f["announcement_id"])
+                    known_ids.add(f.announcement_id)
 
                 if args.download and new_filings:
-                    dl = download_filings(
-                        session, new_filings, args.doc_dir, cache, args.parallel,
+                    dl = batch_download(
+                        conn,
+                        [f.__dict__ for f in new_filings],
+                        args.doc_dir,
+                        args.parallel,
                     )
                     log.info("  Downloaded %d/%d docs.", dl, len(new_filings))
 
@@ -722,8 +626,12 @@ def cmd_monitor(args):
                 while page_num <= MAX_API_PAGES:
                     _polite_delay()
                     resp = query_announcements(
-                        session, page_num=page_num, category=category,
-                        column=column, sort_name="time", sort_type="desc",
+                        session,
+                        page_num=page_num,
+                        category=category,
+                        column=column,
+                        sort_name="time",
+                        sort_type="desc",
                     )
                     page_filings = parse_announcements(resp)
                     if not page_filings:
@@ -731,37 +639,37 @@ def cmd_monitor(args):
 
                     page_new = [
                         f for f in page_filings
-                        if f["announcement_id"] not in known_ids
+                        if f.announcement_id not in known_ids
                     ]
                     if not page_new:
                         log.info("  Page %d: 0 new — caught up.", page_num)
                         break
 
                     all_new.extend(page_new)
-                    cache.insert_batch(page_new)
+                    insert_batch(conn, page_new)
                     for f in page_new:
-                        known_ids.add(f["announcement_id"])
+                        known_ids.add(f.announcement_id)
 
                     log.info("  Page %d: %d new filings", page_num, len(page_new))
 
                     if args.download:
-                        dl = download_filings(
-                            session, page_new, args.doc_dir, cache, args.parallel,
+                        dl = batch_download(
+                            conn,
+                            [f.__dict__ for f in page_new],
+                            args.doc_dir,
+                            args.parallel,
                         )
                         log.info("  Downloaded %d/%d docs.", dl, len(page_new))
 
                     page_num += 1
 
-                log.info(
-                    "[Poll %d] Total new: %d filings.",
-                    polls, len(all_new),
-                )
+                log.info("[Poll %d] Total new: %d filings.", polls, len(all_new))
                 for f in all_new[:5]:
                     log.info(
                         "  %s | %s | %s",
-                        f.get("sec_code", "")[:8],
-                        f.get("title", "")[:40],
-                        f.get("announcement_date", ""),
+                        f.sec_code[:8],
+                        f.title[:40],
+                        f.announcement_date,
                     )
             else:
                 log.info("[Poll %d] No new filings. Known: %d", polls, len(known_ids))
@@ -771,25 +679,32 @@ def cmd_monitor(args):
     except KeyboardInterrupt:
         log.info("Monitor stopped. %d polls, %d filings known.", polls, len(known_ids))
     finally:
-        cache.close()
+        conn.close()
 
 
-def cmd_export(args):
-    cache = FilingCache(args.db)
-    cache.export_json(args.output)
-    cache.close()
+# ---------------------------------------------------------------------------
+# Export / stats commands
+# ---------------------------------------------------------------------------
 
 
-def cmd_stats(args):
-    cache = FilingCache(args.db)
-    s = cache.stats()
-    print(f"Total filings:    {s['total'] or 0}")
-    print(f"Downloaded:       {s['downloaded'] or 0}")
-    print(f"Pending:          {s['pending'] or 0}")
-    print(f"Companies:        {s['unique_companies'] or 0}")
-    print(f"Oldest filing:    {s['oldest'] or 'N/A'}")
-    print(f"Newest filing:    {s['newest'] or 'N/A'}")
-    cache.close()
+def cmd_export(args: argparse.Namespace) -> None:
+    """Export cached filings to JSON."""
+    conn = get_db(args.db)
+    export_json(conn, args.output)
+    conn.close()
+
+
+def cmd_stats(args: argparse.Namespace) -> None:
+    """Print filing cache statistics."""
+    conn = get_db(args.db)
+    s = stats(conn)
+    print(f"Total filings:    {s.get('total') or 0}")
+    print(f"Downloaded:       {s.get('downloaded') or 0}")
+    print(f"Pending:          {s.get('pending') or 0}")
+    print(f"Companies:        {s.get('unique_companies') or 0}")
+    print(f"Oldest filing:    {s.get('oldest') or 'N/A'}")
+    print(f"Newest filing:    {s.get('newest') or 'N/A'}")
+    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -797,17 +712,27 @@ def cmd_stats(args):
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main() -> None:
+    """Entry point — parse arguments and dispatch to the appropriate command."""
     p = argparse.ArgumentParser(
         description="CNINFO Chinese Securities Filing Scraper (巨潮资讯网)"
+    )
+    p.add_argument(
+        "--log-file",
+        default=None,
+        help="Optional path for a rotating log file (in addition to stderr)",
     )
     sub = p.add_subparsers(dest="command")
 
     # -- crawl --
     c = sub.add_parser("crawl", help="Crawl filings from CNINFO")
-    c.add_argument("--max-pages", type=int, default=10, help="Max pages per query (default: 10)")
+    c.add_argument(
+        "--max-pages", type=int, default=10, help="Max pages per query (default: 10)"
+    )
     c.add_argument("--download", action="store_true", help="Download documents")
-    c.add_argument("--parallel", type=int, default=5, help="Download workers (default: 5)")
+    c.add_argument(
+        "--parallel", type=int, default=5, help="Download workers (default: 5)"
+    )
     c.add_argument("--doc-dir", default="documents", help="Download directory")
     c.add_argument("--db", default=DB_FILE)
     c.add_argument(
@@ -822,19 +747,46 @@ def main():
         default="all",
         help="Exchange filter (default: all = SH+SZ+BJ)",
     )
-    c.add_argument("--date-from", help="Start date YYYY-MM-DD (enables date-range splitting)")
+    c.add_argument(
+        "--date-from", help="Start date YYYY-MM-DD (enables date-range splitting)"
+    )
     c.add_argument("--date-to", help="End date YYYY-MM-DD")
     c.add_argument("--search", help="Keyword search in titles")
     c.add_argument(
-        "--concurrency", type=int, default=1,
+        "--concurrency",
+        type=int,
+        default=1,
         help="Parallel date-range workers (default: 1, try 3-5 for speed)",
+    )
+    c.add_argument(
+        "--incremental",
+        action="store_true",
+        help=(
+            "Skip date ranges already in the cache. "
+            "Uses the newest announcement_date as the cutoff."
+        ),
+    )
+    c.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue an interrupted crawl by skipping already-cached "
+            "announcement IDs within the target date range."
+        ),
     )
 
     # -- monitor --
     m = sub.add_parser("monitor", help="Watch for new filings")
-    m.add_argument("--interval", type=int, default=300, help="Poll interval seconds (default: 300)")
+    m.add_argument(
+        "--interval",
+        type=int,
+        default=300,
+        help="Poll interval seconds (default: 300)",
+    )
     m.add_argument("--download", action="store_true", help="Auto-download new filings")
-    m.add_argument("--parallel", type=int, default=5, help="Download workers (default: 5)")
+    m.add_argument(
+        "--parallel", type=int, default=5, help="Download workers (default: 5)"
+    )
     m.add_argument("--doc-dir", default="documents")
     m.add_argument("--db", default=DB_FILE)
     m.add_argument("--category", choices=list(CATEGORIES.keys()), default="")
@@ -846,10 +798,13 @@ def main():
     e.add_argument("--db", default=DB_FILE)
 
     # -- stats --
-    sub.add_parser("stats", help="Show cache statistics").add_argument("--db", default=DB_FILE)
+    st = sub.add_parser("stats", help="Show cache statistics")
+    st.add_argument("--db", default=DB_FILE)
 
     args = p.parse_args()
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+    _configure_logging(getattr(args, "log_file", None))
 
     cmds = {
         "crawl": cmd_crawl,
