@@ -174,3 +174,93 @@ Save ALL reverse-engineering work in `_investigation/`:
 - Protocol documentation
 
 This evidence is invaluable for debugging when things break later.
+
+---
+
+## What Actually Happened (Reasoning Trace — 2026-04-13)
+
+### Decision: Parallel-first investigation
+
+Launched 4 parallel agents simultaneously rather than sequentially:
+1. **Recon agent** — probed CNINFO headers, robots.txt, tried the API with WebFetch
+2. **GitHub research agent** — `gh search repos/code` for existing scrapers
+3. **Sibling project review agent** — read task1/ and task2/ scraper code to extract patterns
+4. **Web research agent** — searched for blog posts and API documentation
+
+**Reasoning:** Each agent costs ~30-60s. Running 4 sequentially = 2-4 min. Running in parallel = same wall time as 1.
+
+### Key discovery: CNINFO has ZERO bot protection
+
+The recon agent came back with the best possible news:
+- **No WAF** (no Cloudflare, Radware, Akamai, Azure)
+- **No TLS fingerprinting** — plain `requests` works
+- **No JavaScript challenges**, no captchas
+- **No required cookies/sessions** for API access
+- **robots.txt returns 404**
+
+This made Phases 3-7 of the methodology unnecessary. We skipped straight from Phase 2 to Phase 8.
+
+### Key discovery: GitHub prior art is extensive
+
+Found 8+ repos all using the same endpoint: `POST /new/hisAnnouncement/query`. Every repo agreed on:
+- Same API parameters
+- Same response format
+- Same download URL pattern
+- Same 100-page pagination cap
+
+This saved hours of reverse-engineering. The protocol was already fully documented by the community.
+
+### Architecture decision: Copy task2 (SEDAR+) patterns, strip complexity
+
+Task2's architecture was closest to what we needed. We kept:
+- argparse subcommand CLI (crawl, monitor, export, stats)
+- FilingCache class with SQLite
+- ThreadPoolExecutor for parallel downloads
+- Logging setup
+- JSON export envelope format
+
+We removed:
+- curl_cffi (plain requests instead — no TLS bypass needed)
+- Headless Chrome fallback (no bot protection to bypass)
+- Catalyst state machine logic (CNINFO API is stateless)
+- Download-before-paginate constraint (CNINFO URLs are permanent)
+
+### Critical bug: Static CDN returns 404 with API headers
+
+**First test run:** All downloads returned 404 despite API queries working.
+
+**Root cause:** The scraper's `requests.Session` had API headers set globally (including `X-Requested-With: XMLHttpRequest` and `Content-Type: application/x-www-form-urlencoded`). The static CDN at `static.cninfo.com.cn` rejected requests with these headers.
+
+**Fix:** Created separate `DOWNLOAD_HEADERS` with only `Accept` and `User-Agent` for GET requests to the CDN. Used `requests.get()` with explicit headers instead of the session.
+
+**Verification:** HEAD request test confirmed 2024 filing URLs return 200 with clean headers. Full download test confirmed 30/30 PDFs downloaded successfully.
+
+### 100-page cap workaround
+
+CNINFO caps API results at ~100 pages. Beyond that, it silently returns duplicate data.
+
+**Solution:** `--date-from`/`--date-to` flags split queries into daily date ranges using `generate_date_ranges()`. Each day rarely exceeds 100 pages even during peak filing season (March-April for annual reports).
+
+**Added --concurrency flag** to process multiple date ranges in parallel, since the API is stateless and downloads go to a separate CDN.
+
+### Test results (March 2024 annual reports)
+
+Full month test (31 date ranges, --max-pages 20, --download):
+- **1,500+ filings scraped** across all March 2024 dates
+- **1,500+ PDFs downloaded** (3+ GB)
+- **Zero errors** after the header fix
+- **Zero rate limiting or blocking**
+- Peak days: March 29 (486 filings), March 30 (575 filings), March 28 (241 filings)
+
+### Complexity comparison across all 3 projects
+
+| Aspect | Mexico (CNBV) | Canada (SEDAR+) | China (CNINFO) |
+|--------|--------------|-----------------|----------------|
+| Bot protection | Azure WAF | Radware Bot Manager | **None** |
+| HTTP library | requests | curl_cffi | **requests** |
+| State management | ViewState + DevExpress callbacks | Oracle Catalyst state machine | **Stateless JSON API** |
+| Download URLs | 3-step enc token chain | Session-bound, expire on paginate | **Permanent CDN URLs** |
+| Pagination | Complex callback format | Sequential only | **Random-access page numbers** |
+| Dependencies | 5 | 5 | **1** (just requests) |
+| Lines of code | 1,188 | 765 | **~500** |
+| Difficulty | Hard | Very Hard | **Easy** |
