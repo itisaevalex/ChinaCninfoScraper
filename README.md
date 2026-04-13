@@ -19,6 +19,10 @@
 
 *380K+ filings across all Chinese exchanges. Pure `requests`. One dependency. Zero bot protection.*
 
+[![License: Proprietary](https://img.shields.io/badge/License-Proprietary-red.svg)](#license)
+
+**Created by Alexander Isaev | [Data Alchemy Labs](https://github.com/itisaevalex)**
+
 </div>
 
 ---
@@ -268,3 +272,9 @@ china-scraper/
 | Canada | SEDAR+ | [SedarPlusScraper](https://github.com/itisaevalex/SedarPlusScraper) |
 | Mexico | CNBV STIV-2 | [MexicanReportsScraperExtended](https://github.com/itisaevalex/MexicanReportsScraperExtended) |
 | China | CNINFO 巨潮资讯网 | **This repo** |
+
+## License
+
+Copyright (c) 2026 Alexander Isaev / Data Alchemy Labs. All rights reserved.
+
+This software is proprietary. See [LICENSE](LICENSE) for details. Commercial use, redistribution, or derivative works require explicit written authorization.
