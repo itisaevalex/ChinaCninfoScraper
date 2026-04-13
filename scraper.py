@@ -31,6 +31,7 @@ import random
 import re
 import sqlite3
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -297,24 +298,42 @@ def download_filings(
                 log.warning("Download failed (%d): %s", resp.status_code, url)
                 return None
 
-            # Build filename: secCode_title.ext
+            # HIGH-4 fix: validate content is actually a PDF, not an error page
+            content = resp.content
+            if not content.startswith(b"%PDF"):
+                log.warning(
+                    "Not a PDF (got %r...): %s", content[:30], url,
+                )
+                return None
+
+            # Build filename with announcement_id to prevent collisions (HIGH-5)
             sec_code = filing.get("sec_code", "unknown")
             title = filing.get("title", "doc")
             ext = filing.get("adjunct_type", "PDF").upper()
 
-            # Sanitize filename
             safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', title)
-            safe_title = safe_title.replace("*", "＊")[:80]
-            filename = f"{sec_code}_{safe_title}.{ext}"
+            safe_title = safe_title.replace("*", "＊")[:70]
+            filename = f"{sec_code}_{ann_id[:8]}_{safe_title}.{ext}"
 
+            # HIGH-3 fix: atomic write via temp file, propagate disk errors
             filepath = os.path.join(doc_dir, filename)
-            with open(filepath, "wb") as fh:
-                fh.write(resp.content)
+            part_path = filepath + ".part"
+            try:
+                with open(part_path, "wb") as fh:
+                    fh.write(content)
+                os.replace(part_path, filepath)
+            except OSError as e:
+                log.error("Disk write failed (%s). Aborting.", e)
+                try:
+                    os.unlink(part_path)
+                except OSError:
+                    pass
+                raise
 
             time.sleep(DELAY_BETWEEN_DOWNLOADS + random.uniform(0, DELAY_JITTER))
             return (ann_id, filepath)
-        except Exception as e:
-            log.warning("Download error for %s: %s", ann_id, e)
+        except requests.RequestException as e:
+            log.warning("Network error for %s: %s", ann_id, e)
             return None
 
     if parallel > 1 and len(to_download) > 1:
@@ -344,7 +363,7 @@ def download_filings(
 
 class FilingCache:
     def __init__(self, db_path: str = DB_FILE):
-        self.conn = sqlite3.connect(db_path)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS filings (
@@ -486,8 +505,10 @@ def cmd_crawl(args):
     total_new = 0
     total_downloaded = 0
 
-    # Determine if we need date-range splitting
-    if args.date_from and args.date_to:
+    try:
+
+      # Determine if we need date-range splitting
+      if args.date_from and args.date_to:
         date_ranges = generate_date_ranges(args.date_from, args.date_to)
         concurrency = getattr(args, "concurrency", 1) or 1
         log.info(
@@ -497,18 +518,19 @@ def cmd_crawl(args):
         )
 
         # Lock for thread-safe SQLite and counter updates
-        import threading
         counter_lock = threading.Lock()
 
         def _crawl_date_range(idx_dr: tuple[int, str]) -> tuple[int, int, int]:
             """Crawl a single date range. Returns (filings, new, downloaded)."""
             idx, dr = idx_dr
+            # HIGH-2 fix: each worker gets its own session (requests.Session is not thread-safe)
+            local_session = create_session() if concurrency > 1 else session
             range_filings = 0
             range_new = 0
             range_downloaded = 0
 
             resp = query_announcements(
-                session, page_num=1, category=category,
+                local_session, page_num=1, category=category,
                 column=column, date_range=dr,
                 search_key=args.search or "",
             )
@@ -528,7 +550,7 @@ def cmd_crawl(args):
             )
 
             if args.download and filings:
-                dl = download_filings(session, filings, args.doc_dir, cache, args.parallel)
+                dl = download_filings(local_session, filings, args.doc_dir, cache, args.parallel)
                 range_downloaded += dl
 
             # Paginate within this date range
@@ -536,7 +558,7 @@ def cmd_crawl(args):
             for page_num in range(2, pages_to_fetch + 1):
                 _polite_delay()
                 resp = query_announcements(
-                    session, page_num=page_num, category=category,
+                    local_session, page_num=page_num, category=category,
                     column=column, date_range=dr,
                     search_key=args.search or "",
                 )
@@ -554,18 +576,26 @@ def cmd_crawl(args):
                 )
 
                 if args.download and filings:
-                    dl = download_filings(session, filings, args.doc_dir, cache, args.parallel)
+                    dl = download_filings(local_session, filings, args.doc_dir, cache, args.parallel)
                     range_downloaded += dl
 
             return (range_filings, range_new, range_downloaded)
 
+        # MEDIUM-1 fix: use as_completed with error handling instead of pool.map
         if concurrency > 1:
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                futs = pool.map(_crawl_date_range, enumerate(date_ranges, 1))
-                for r_filings, r_new, r_dl in futs:
-                    total_filings += r_filings
-                    total_new += r_new
-                    total_downloaded += r_dl
+                futs = {
+                    pool.submit(_crawl_date_range, idx_dr): idx_dr
+                    for idx_dr in enumerate(date_ranges, 1)
+                }
+                for fut in as_completed(futs):
+                    try:
+                        r_filings, r_new, r_dl = fut.result()
+                        total_filings += r_filings
+                        total_new += r_new
+                        total_downloaded += r_dl
+                    except Exception as exc:
+                        log.error("Date range %s failed: %s", futs[fut], exc)
         else:
             for idx_dr in enumerate(date_ranges, 1):
                 r_filings, r_new, r_dl = _crawl_date_range(idx_dr)
@@ -574,7 +604,7 @@ def cmd_crawl(args):
                 total_downloaded += r_dl
                 _polite_delay()
 
-    else:
+      else:
         # No date range — simple paginated crawl
         date_range = ""
         if args.date_from:
@@ -632,14 +662,15 @@ def cmd_crawl(args):
                 log.info("No more pages. Stopping.")
                 break
 
-    elapsed = time.time() - t_start
-    stats = cache.stats()
-    log.info(
-        "Done: %d filings (%d new), %d downloaded in %.1fs. DB: %d total, %d companies.",
-        total_filings, total_new, total_downloaded, elapsed,
-        stats["total"] or 0, stats["unique_companies"] or 0,
-    )
-    cache.close()
+      elapsed = time.time() - t_start
+      stats = cache.stats()
+      log.info(
+          "Done: %d filings (%d new), %d downloaded in %.1fs. DB: %d total, %d companies.",
+          total_filings, total_new, total_downloaded, elapsed,
+          stats["total"] or 0, stats["unique_companies"] or 0,
+      )
+    finally:
+        cache.close()
 
 
 def cmd_monitor(args):

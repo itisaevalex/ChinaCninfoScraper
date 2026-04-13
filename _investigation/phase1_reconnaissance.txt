@@ -1,0 +1,278 @@
+CNINFO (巨潮资讯网) Phase 1 Reconnaissance Results
+===================================================
+Date: 2026-04-13
+
+1. TECH STACK
+=============
+
+Server: openresty (Nginx-based)
+Backend: Java (JSESSIONID cookie, Spring MVC likely)
+Frontend: Vue.js 2.x + axios + Element UI
+CDN: Huawei Cloud CDN (X-CCDN headers, SF_cookie)
+Static assets: //static.cninfo.com.cn/new/
+Real-time data: Custom WebSocket SDK (NSDK/NWeb.js - charting library)
+Analytics: SZSE TalkingData SDK (28F70D21C62B4B6396DE05F9EF7DC68F)
+Fingerprinting: Fingerprint2.js (browser fingerprint for market data WebSocket auth only)
+
+Response Headers (key):
+  Server: openresty
+  Set-Cookie: JSESSIONID=...; Path=/new; HttpOnly
+  Set-Cookie: SF_cookie_4=...; path=/
+  Content-Type: application/json;charset=UTF-8 (for API)
+  Access-Control-Allow-Methods: GET, POST, OPTIONS
+  Access-Control-Allow-Credentials: true
+  via: EU-GBR-london-EDGE2-CACHE... (Huawei Cloud CDN edge nodes)
+  X-CCDN-Origin-Time: ~300-600ms
+  Content-Security-Policy: *.cninfo.com.cn *.szse.cn
+
+
+2. BOT PROTECTION
+=================
+
+VERDICT: MINIMAL - Almost no bot protection on the API.
+
+Tested:
+  - Plain curl with minimal headers: WORKS
+  - Python requests should work fine
+  - No TLS fingerprinting detected
+  - No JavaScript challenge pages
+  - No Cloudflare/Radware/Akamai WAF
+  - No rate limiting observed on small test volumes
+  - robots.txt: 404 (not found - no restrictions declared)
+
+Fingerprint2.js exists but is ONLY used for:
+  - WebSocket SDK authentication (market data streaming)
+  - NOT for regular HTTP API requests
+  - The API works without any fingerprint/cookie
+
+The sdkConnect.js generates a browser fingerprint for the NSDK real-time
+market data connection. This is irrelevant for filing/announcement scraping.
+
+Cookies:
+  - JSESSIONID: Standard Java session cookie, auto-set by server
+  - SF_cookie_4: CDN tracking cookie
+  - Neither is required for API access (tested without cookies, still works)
+
+
+3. API ENDPOINTS DISCOVERED
+============================
+
+BASE: http://www.cninfo.com.cn/new
+
+3a. Historical Announcement Query (PRIMARY - use this for scraping)
+   POST /new/hisAnnouncement/query
+   Content-Type: application/x-www-form-urlencoded
+
+   Parameters:
+     stock        = "secCode,orgId" (e.g., "000001,gssz0000001") or empty for all
+     tabName      = "fulltext"
+     pageSize     = 1-30 (tested up to 30)
+     pageNum      = 1-based page number
+     column       = "szse" | "sse" | "bse" | "" (exchange filter)
+     category     = category code (e.g., "category_ndbg_szsh" for annual reports)
+     plate        = "sz" | "sh" | "" (board filter)
+     seDate       = date range (format TBD)
+     searchkey    = keyword search (Chinese)
+     isHLContent  = "true" (HTML highlight in results)
+
+   Response (JSON):
+     {
+       "totalAnnouncement": 382939,
+       "totalRecordNum": 382939,
+       "announcements": [{
+         "secCode": "600848",
+         "secName": "上海临港",
+         "orgId": "gssh0600848",
+         "announcementId": "1225099846",
+         "announcementTitle": "2025年年度报告",
+         "announcementTime": 1776096000000,  // Unix ms timestamp
+         "adjunctUrl": "finalpage/2026-04-14/1225099846.PDF",
+         "adjunctSize": 1417,  // KB
+         "adjunctType": "PDF",
+         "columnId": "250401||251302",
+         "pageColumn": "SHZB",
+         "announcementType": "01010503||010113||010301",
+         "shortTitle": "2025年年度报告",
+         ...
+       }],
+       "hasMore": true,
+       "totalpages": 12764
+     }
+
+   PDF URL construction:
+     http://static.cninfo.com.cn/{adjunctUrl}
+     e.g., http://static.cninfo.com.cn/finalpage/2026-04-14/1225099846.PDF
+
+
+3b. Full-Text Search
+   POST /new/fulltextSearch/full
+   Content-Type: application/x-www-form-urlencoded
+
+   Parameters:
+     searchkey    = "平安银行年报" (keyword)
+     sdate        = start date
+     edate        = end date
+     isfulltext   = false | true
+     sortName     = "pubdate"
+     sortType     = "desc"
+     pageNum      = 1-based
+     pageSize     = 5-20
+
+   Returns same JSON structure as hisAnnouncement/query but with
+   HTML <em> tags in titles for search highlight.
+
+
+3c. Stock Search/Lookup
+   POST /new/information/topSearch/query
+
+   Parameters:
+     keyWord = "平安银行" or "000001"
+     maxNum  = 10
+
+   Response (JSON array):
+     [{
+       "code": "000001",
+       "pinyin": "payh",
+       "category": "A股",
+       "type": "shj",
+       "delisted": "false",
+       "orgId": "gssz0000001",
+       "zwjc": "平安银行"
+     }]
+
+   This is essential for resolving stock code -> orgId mapping.
+
+
+3d. Other endpoints found in JS:
+   POST /new/executive/recommend
+   POST /new/executive/relative
+   POST /new/fulltextSearch/hotwordspage
+   POST /new/information/topSearch/detailOfQuery
+   POST /new/senior-search/company-information
+   POST /new/senior-search/split
+   POST /new/singleDisclosure/getStockPlateNew
+   POST /new/userAnnouncement/getTradeDay
+   GET  /new/index/getSDKSign?type=1
+   GET  /new/index/getEnvType
+
+
+4. STOCK PARAMETER FORMAT
+==========================
+
+CRITICAL FINDING: The stock param in hisAnnouncement/query requires
+BOTH the stock code AND the orgId, comma-separated:
+
+  stock=000001,gssz0000001   (Shenzhen stock)
+  stock=600000,gssh0600000   (Shanghai stock)
+
+orgId prefixes:
+  gssz  = Shenzhen Stock Exchange (SZSE)
+  gssh  = Shanghai Stock Exchange (SSE)
+  gfbj  = Beijing Stock Exchange (BSE) / formerly NEEQ
+  9900  = Some companies use numeric orgIds
+
+Use the topSearch/query API to resolve code -> orgId.
+
+
+5. CATEGORY CODES (Filing Types)
+=================================
+
+Known category codes (from prior art and testing):
+  category_ndbg_szsh  = Annual reports (年报)
+  category_bndbg_szsh = Semi-annual reports (半年报)
+  category_yjdbg_szsh = Q1 reports (一季度报)
+  category_sjdbg_szsh = Q3 reports (三季度报)
+  category_zqgg_szsh  = Bond announcements
+  category_gddh_szsh  = Shareholder meetings
+  category_gqbd_szsh  = Equity changes
+
+announcementType codes (from API responses):
+  01010503 = Annual report related
+  010112   = SZSE main board
+  010113   = SSE main board
+  010115   = ChiNext (创业板)
+  010123   = STAR Market (科创板)
+  010301   = Regular report
+
+pageColumn values:
+  SZZB  = Shenzhen Main Board
+  SZCY  = ChiNext (创业板)
+  SHZB  = Shanghai Main Board
+  SHKCB = STAR Market (科创板)
+
+
+6. PDF DOWNLOAD
+================
+
+PDFs are served from static CDN:
+  Base URL: http://static.cninfo.com.cn/
+  Full URL: http://static.cninfo.com.cn/{adjunctUrl}
+
+Response headers for PDF:
+  Content-Type: application/pdf
+  Server: openresty
+  X-CCDN-CacheTTL: 31104000 (360 days cache)
+  Access-Control-Allow-Origin: http://*.cninfo.com.cn,https://*.cninfo.com.cn
+
+PDFs are directly accessible without authentication or referrer check.
+No token or encrypted URL needed (unlike SEDAR+ or CNBV).
+
+
+7. PAGINATION
+==============
+
+- Standard page-based pagination (pageNum + pageSize)
+- Random access supported (can jump to any page)
+- No sequential-only restriction (unlike Oracle Catalyst on SEDAR+)
+- No state invalidation between pages
+- hasMore field indicates if more pages exist
+- totalpages gives total page count
+
+
+8. COMPARISON WITH SEDAR+ AND CNBV
+=====================================
+
+CNINFO is dramatically easier than both previous targets:
+
+| Feature              | SEDAR+ (Canada) | CNBV (Mexico) | CNINFO (China) |
+|---------------------|-----------------|---------------|----------------|
+| Bot protection      | Radware WAF     | None          | None           |
+| TLS fingerprinting  | Yes (JA3/JA4)   | No            | No             |
+| HTTP library needed | curl_cffi       | requests      | requests       |
+| State machine       | Oracle Catalyst | ASP.NET       | None (stateless)|
+| Pagination          | Sequential only | ViewState     | Random access  |
+| Auth required       | No              | No            | No             |
+| PDF access          | Token URLs      | Enc URLs      | Direct static  |
+| API format          | HTML scraping   | HTML scraping | Clean JSON API |
+
+
+9. RECOMMENDED APPROACH
+========================
+
+This is the simplest target of the three:
+
+1. Use plain `requests` library - no curl_cffi or browser needed
+2. Use POST /new/hisAnnouncement/query for filing enumeration
+3. Use POST /new/information/topSearch/query for stock lookup
+4. Download PDFs directly from http://static.cninfo.com.cn/{adjunctUrl}
+5. Cache results in SQLite (same pattern as other scrapers)
+6. Pagination is stateless - can parallelize page fetches
+7. Can parallelize PDF downloads freely (no state invalidation)
+
+Minimal headers needed:
+  Content-Type: application/x-www-form-urlencoded
+  User-Agent: Mozilla/5.0 (any browser-like UA)
+
+No cookies, no session, no tokens required for the API or PDF downloads.
+
+
+10. RISKS AND CONCERNS
+========================
+
+- Rate limiting: Not observed in testing, but should add delays to be safe
+- IP blocking: Possible at scale, add backoff/retry logic
+- The API returned 382,939+ total announcements - large volume
+- Chinese-only content (stock names, titles, categories)
+- announcementTime is Unix milliseconds (divide by 1000 for seconds)
+- adjunctSize appears to be in KB (not bytes)
+- Some PDFs can be very large (89MB observed for one filing)
