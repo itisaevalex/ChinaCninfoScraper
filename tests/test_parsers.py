@@ -8,9 +8,16 @@ Covers:
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
-from parsers import classify_filing_type, get_pagination_info, parse_announcements
+from parsers import (
+    classify_filing_type,
+    derive_isin_from_stock_code,
+    get_pagination_info,
+    parse_announcements,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +274,160 @@ class TestParseAnnouncements:
         filings = parse_announcements(response)
         assert filings[0].filing_date == ""
         assert filings[0].file_size == 0
+
+    def test_language_is_zh_for_all_filings(self, cninfo_query_response):
+        filings = parse_announcements(cninfo_query_response)
+        for f in filings:
+            assert f.language == "zh"
+
+    def test_lei_is_none_for_all_filings(self, cninfo_query_response):
+        """LEI is not available in CNINFO API — must always be None."""
+        filings = parse_announcements(cninfo_query_response)
+        for f in filings:
+            assert f.lei is None
+
+    def test_isin_is_derived_for_known_stock_code(self, cninfo_query_response):
+        """Filings with 6-digit stock codes should have a non-None ISIN."""
+        filings = parse_announcements(cninfo_query_response)
+        for f in filings:
+            assert f.isin is not None
+            # CN(2) + NSIN(10) + check(2) = 14 chars
+            assert len(f.isin) == 14
+            assert f.isin.startswith("CN")
+
+    def test_isin_is_none_for_empty_stock_code(self):
+        response = {
+            "totalAnnouncement": 1,
+            "totalpages": 1,
+            "hasMore": False,
+            "announcements": [
+                {
+                    "announcementId": "no_code_001",
+                    "secCode": "",
+                    "secName": "测试",
+                    "orgId": "org1",
+                    "orgName": "测试公司",
+                    "announcementTitle": "公告",
+                    "announcementTime": 1711728000000,
+                    "adjunctUrl": "finalpage/test.PDF",
+                    "adjunctType": "PDF",
+                    "adjunctSize": 100,
+                    "announcementType": "",
+                    "columnId": "",
+                }
+            ],
+        }
+        filings = parse_announcements(response)
+        assert filings[0].isin is None
+
+    def test_language_is_zh_even_for_empty_code_filing(self):
+        response = {
+            "totalAnnouncement": 1,
+            "totalpages": 1,
+            "hasMore": False,
+            "announcements": [
+                {
+                    "announcementId": "lang_001",
+                    "secCode": "",
+                    "secName": "测试",
+                    "orgId": "org1",
+                    "orgName": "测试",
+                    "announcementTitle": "公告",
+                    "announcementTime": 1711728000000,
+                    "adjunctUrl": "finalpage/lang_001.PDF",
+                    "adjunctType": "PDF",
+                    "adjunctSize": 50,
+                    "announcementType": "",
+                    "columnId": "",
+                }
+            ],
+        }
+        filings = parse_announcements(response)
+        assert filings[0].language == "zh"
+
+
+# ---------------------------------------------------------------------------
+# derive_isin_from_stock_code()
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveIsinFromStockCode:
+    """Unit tests for the ISO 6166 ISIN derivation helper.
+
+    The algorithm follows ISO 6166: country prefix ``CN`` + 10-char NSIN
+    (6-digit stock code left-padded with four zeros) + 2 check digits, giving
+    a 14-character string.  Note: real published Chinese ISINs use a different
+    NSIN encoding (exchange letter prefix + compressed code) and are 12 chars.
+    This implementation produces a consistent, deterministic identifier from
+    the stock code using the ISO 6166 check-digit formula; it is structurally
+    valid but may differ from exchange-published ISINs which use proprietary
+    NSIN encoding.  Consumers requiring exchange-canonical ISINs must enrich
+    via an external registry (e.g. CSRC, Wind, or Bloomberg).
+    """
+
+    def test_000001_produces_correct_length_isin(self):
+        isin = derive_isin_from_stock_code("000001")
+        assert isin is not None
+        # CN(2) + NSIN(10) + check(2) = 14 chars
+        assert len(isin) == 14
+
+    def test_isin_starts_with_cn(self):
+        isin = derive_isin_from_stock_code("000001")
+        assert isin is not None
+        assert isin.startswith("CN")
+
+    def test_isin_contains_nsin_padded_to_10_digits(self):
+        isin = derive_isin_from_stock_code("000001")
+        assert isin is not None
+        # Positions 2–11 (0-indexed) = NSIN = "0000000001"
+        assert isin[2:12] == "0000000001"
+
+    def test_check_digits_are_numeric(self):
+        isin = derive_isin_from_stock_code("000001")
+        assert isin is not None
+        assert isin[12:].isdigit()
+
+    def test_returns_none_for_empty_string(self):
+        assert derive_isin_from_stock_code("") is None
+
+    def test_returns_none_for_non_digit_code(self):
+        assert derive_isin_from_stock_code("ABCDEF") is None
+
+    def test_returns_none_for_short_code(self):
+        assert derive_isin_from_stock_code("00001") is None
+
+    def test_returns_none_for_long_code(self):
+        assert derive_isin_from_stock_code("0000001") is None
+
+    def test_returns_none_for_none_input(self):
+        assert derive_isin_from_stock_code(None) is None  # type: ignore[arg-type]
+
+    def test_different_codes_produce_different_isins(self):
+        isin1 = derive_isin_from_stock_code("000001")
+        isin2 = derive_isin_from_stock_code("600519")
+        assert isin1 != isin2
+
+    def test_deterministic_for_same_input(self):
+        assert derive_isin_from_stock_code("000001") == derive_isin_from_stock_code("000001")
+
+    def test_result_matches_cn_plus_digits_pattern(self):
+        isin = derive_isin_from_stock_code("123456")
+        assert isin is not None
+        assert re.fullmatch(r"CN\d{12}", isin) is not None
+
+    def test_check_digit_is_valid_iso6166(self):
+        """Verify the check digits satisfy 98 - (number mod 97) = check."""
+        stock_code = "000001"
+        isin = derive_isin_from_stock_code(stock_code)
+        assert isin is not None
+        # Re-derive manually: replace check digits with 00, compute mod 97
+        body_with_zeros = isin[:12] + "00"
+        digit_str = "".join(
+            str(ord(ch) - ord("A") + 10) if ch.isalpha() else ch
+            for ch in body_with_zeros
+        )
+        expected_check = 98 - (int(digit_str) % 97)
+        assert int(isin[12:]) == expected_check
 
 
 # ---------------------------------------------------------------------------

@@ -78,12 +78,43 @@ class TestGetDb:
         }
         required = {
             "filing_id", "source", "country", "ticker", "company_name",
+            "isin", "lei", "language",
             "filing_date", "filing_time", "headline", "filing_type",
             "category", "document_url", "direct_download_url",
             "file_size", "num_pages", "price_sensitive",
             "downloaded", "download_path", "raw_metadata", "created_at",
         }
         assert required.issubset(cols)
+
+    def test_filings_table_has_isin_column(self, mem_db):
+        cols = {
+            row[1].lower()
+            for row in mem_db.execute("PRAGMA table_info(filings)").fetchall()
+        }
+        assert "isin" in cols
+
+    def test_filings_table_has_lei_column(self, mem_db):
+        cols = {
+            row[1].lower()
+            for row in mem_db.execute("PRAGMA table_info(filings)").fetchall()
+        }
+        assert "lei" in cols
+
+    def test_filings_table_has_language_column(self, mem_db):
+        cols = {
+            row[1].lower()
+            for row in mem_db.execute("PRAGMA table_info(filings)").fetchall()
+        }
+        assert "language" in cols
+
+    def test_isin_index_exists(self, mem_db):
+        indexes = {
+            row[1]
+            for row in mem_db.execute(
+                "SELECT type, name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        assert "idx_filings_isin" in indexes
 
     def test_creates_crawl_log_table(self, mem_db):
         tables = {
@@ -249,6 +280,36 @@ class TestSchemaMigration:
         assert "country" in cols
         assert "raw_metadata" in cols
 
+    def test_migration_adds_isin_column(self, tmp_path):
+        db_path = self._make_pre_l3_db(tmp_path / "pre_l3.db")
+        conn = get_db(db_path)
+        cols = {
+            row[1].lower()
+            for row in conn.execute("PRAGMA table_info(filings)").fetchall()
+        }
+        conn.close()
+        assert "isin" in cols
+
+    def test_migration_adds_lei_column(self, tmp_path):
+        db_path = self._make_pre_l3_db(tmp_path / "pre_l3.db")
+        conn = get_db(db_path)
+        cols = {
+            row[1].lower()
+            for row in conn.execute("PRAGMA table_info(filings)").fetchall()
+        }
+        conn.close()
+        assert "lei" in cols
+
+    def test_migration_adds_language_column(self, tmp_path):
+        db_path = self._make_pre_l3_db(tmp_path / "pre_l3.db")
+        conn = get_db(db_path)
+        cols = {
+            row[1].lower()
+            for row in conn.execute("PRAGMA table_info(filings)").fetchall()
+        }
+        conn.close()
+        assert "language" in cols
+
     def test_migration_is_idempotent(self, tmp_path):
         """Running get_db() twice on the same pre-L3 file must not raise."""
         db_path = self._make_pre_l3_db(tmp_path / "pre_l3.db")
@@ -322,6 +383,30 @@ class TestUpsertFiling:
         upsert_filing(mem_db, sample_filing_2)
         count = mem_db.execute("SELECT COUNT(*) FROM filings").fetchone()[0]
         assert count == 2
+
+    def test_isin_is_persisted(self, mem_db, sample_filing):
+        upsert_filing(mem_db, sample_filing)
+        row = mem_db.execute(
+            "SELECT isin FROM filings WHERE filing_id=?",
+            (sample_filing.filing_id,),
+        ).fetchone()
+        assert row["isin"] == sample_filing.isin
+
+    def test_lei_is_persisted_as_none(self, mem_db, sample_filing):
+        upsert_filing(mem_db, sample_filing)
+        row = mem_db.execute(
+            "SELECT lei FROM filings WHERE filing_id=?",
+            (sample_filing.filing_id,),
+        ).fetchone()
+        assert row["lei"] is None
+
+    def test_language_defaults_to_zh(self, mem_db, sample_filing):
+        upsert_filing(mem_db, sample_filing)
+        row = mem_db.execute(
+            "SELECT language FROM filings WHERE filing_id=?",
+            (sample_filing.filing_id,),
+        ).fetchone()
+        assert row["language"] == "zh"
 
 
 # ---------------------------------------------------------------------------

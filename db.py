@@ -40,11 +40,14 @@ CREATE TABLE IF NOT EXISTS filings (
     country             TEXT DEFAULT 'CN',
     ticker              TEXT,
     company_name        TEXT,
+    isin                TEXT,
+    lei                 TEXT,
     filing_date         TEXT,
     filing_time         TEXT,
     headline            TEXT,
     filing_type         TEXT DEFAULT 'other',
     category            TEXT,
+    language            TEXT DEFAULT 'zh',
     document_url        TEXT,
     direct_download_url TEXT,
     file_size           TEXT,
@@ -61,6 +64,7 @@ CREATE INDEX IF NOT EXISTS idx_downloaded ON filings(downloaded);
 CREATE INDEX IF NOT EXISTS idx_date       ON filings(filing_date);
 CREATE INDEX IF NOT EXISTS idx_ticker     ON filings(ticker);
 CREATE INDEX IF NOT EXISTS idx_type       ON filings(filing_type);
+CREATE INDEX IF NOT EXISTS idx_filings_isin ON filings(isin);
 
 CREATE TABLE IF NOT EXISTS crawl_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,7 +90,11 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # (table, column_name, ADD COLUMN sql)
     ("filings", "source",              "ALTER TABLE filings ADD COLUMN source TEXT DEFAULT 'cninfo'"),
     ("filings", "country",             "ALTER TABLE filings ADD COLUMN country TEXT DEFAULT 'CN'"),
+    ("filings", "isin",                "ALTER TABLE filings ADD COLUMN isin TEXT"),
+    ("filings", "lei",                 "ALTER TABLE filings ADD COLUMN lei TEXT"),
     ("filings", "filing_time",         "ALTER TABLE filings ADD COLUMN filing_time TEXT"),
+    ("filings", "headline",            "ALTER TABLE filings ADD COLUMN headline TEXT"),
+    ("filings", "language",            "ALTER TABLE filings ADD COLUMN language TEXT DEFAULT 'zh'"),
     ("filings", "num_pages",           "ALTER TABLE filings ADD COLUMN num_pages INTEGER"),
     ("filings", "price_sensitive",     "ALTER TABLE filings ADD COLUMN price_sensitive INTEGER DEFAULT 0"),
     ("filings", "raw_metadata",        "ALTER TABLE filings ADD COLUMN raw_metadata TEXT"),
@@ -118,7 +126,34 @@ _COLUMN_RENAMES: list[tuple[str, str, str]] = [
 
 @dataclass(frozen=True)
 class Filing:
-    """Immutable representation of a single CNINFO filing row (L3 schema)."""
+    """Immutable representation of a single CNINFO filing row (L3 schema).
+
+    Attributes:
+        filing_id:            Unique CNINFO announcement identifier.
+        ticker:               6-digit A-share stock code (e.g. ``"000001"``).
+        company_name:         Chinese company name (e.g. ``"平安银行"``).
+        org_id:               CNINFO internal organisation ID.
+        org_name:             Full legal company name in Chinese.
+        headline:             Filing title with ``<em>`` tags stripped.
+        filing_date:          ISO 8601 date string ``"YYYY-MM-DD"``.
+        announcement_time_ms: Raw millisecond epoch from the API.
+        document_url:         Relative CDN path (``finalpage/…/ID.PDF``).
+        adjunct_type:         Document type reported by API (usually ``"PDF"``).
+        file_size:            File size in bytes (int) or raw string.
+        category:             CNINFO category code (e.g. ``"category_ndbg_szsh"``).
+        column_id:            CNINFO column identifier.
+        direct_download_url:  Absolute CDN URL for direct PDF download.
+        filing_type:          Normalised taxonomy label (e.g. ``"annual_report"``).
+        source:               Always ``"cninfo"``.
+        country:              Always ``"CN"``.
+        isin:                 ISO 6166 ISIN derived from stock code, or ``None``
+                              if derivation is not possible.
+        lei:                  ISO 17442 Legal Entity Identifier (20 chars).
+                              Not available natively from CNINFO; ``None`` unless
+                              populated via an external GLEIF lookup.
+        language:             ISO 639-1 language code. Always ``"zh"`` for CNINFO
+                              filings (Simplified Chinese).
+    """
 
     filing_id: str
     ticker: str
@@ -137,6 +172,9 @@ class Filing:
     filing_type: str = "other"
     source: str = "cninfo"
     country: str = "CN"
+    isin: str | None = None
+    lei: str | None = None
+    language: str = "zh"
 
 
 @dataclass(frozen=True)
@@ -281,11 +319,12 @@ def upsert_filing(conn: sqlite3.Connection, filing: Filing) -> bool:
         """
         INSERT OR IGNORE INTO filings
             (filing_id, source, country, ticker, company_name,
+             isin, lei, language,
              headline, filing_date,
              document_url, file_size,
              category, direct_download_url,
              filing_type, raw_metadata, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             filing.filing_id,
@@ -293,6 +332,9 @@ def upsert_filing(conn: sqlite3.Connection, filing: Filing) -> bool:
             filing.country,
             filing.ticker,
             filing.company_name,
+            filing.isin,
+            filing.lei,
+            filing.language,
             filing.headline,
             filing.filing_date,
             filing.document_url,

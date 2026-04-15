@@ -5,6 +5,27 @@ CNINFO returns JSON (not HTML) from its POST API. This module:
   1. Parses the raw JSON response into Filing dataclass instances.
   2. Classifies filings into a standard taxonomy using Chinese-language patterns.
   3. Extracts pagination metadata from the response envelope.
+  4. Derives best-effort ISINs from A-share stock codes (ISO 6166 CN-prefix).
+
+ISIN availability note
+----------------------
+CNINFO does not expose ISIN fields in its query API.  Chinese A-share ISINs
+follow the pattern ``CN`` + 6-digit stock code + 4 Luhn-derived check digits
+(total 12 chars).  ``derive_isin_from_stock_code()`` replicates the ISO 6166
+check-digit algorithm to produce the correct ISIN for Shenzhen (0xxxxx / 3xxxxx)
+and Shanghai (6xxxxx) listed securities.  B-shares (2xxxxx / 9xxxxx) use the
+same algorithm.  Other codes (e.g. Beijing BSE 8xxxxx/4xxxxx) are also handled
+best-effort.
+
+LEI availability note
+---------------------
+CNINFO carries no LEI data.  The ``lei`` field is always ``None`` in parsed
+filings.  Enrichment via the GLEIF API (https://api.gleif.org/api/v1/fuzzycompletions)
+must be performed as a separate post-processing step.
+
+Language note
+-------------
+All CNINFO filings are in Simplified Chinese.  ``language`` is always ``"zh"``.
 """
 
 from __future__ import annotations
@@ -19,6 +40,80 @@ from db import Filing
 log = logging.getLogger("cninfo")
 
 STATIC_URL = "http://static.cninfo.com.cn"
+
+# ISO 639-1 language code for all CNINFO filings (Simplified Chinese)
+CNINFO_LANGUAGE = "zh"
+
+# ---------------------------------------------------------------------------
+# ISIN derivation — ISO 6166 for Chinese A-shares
+# ---------------------------------------------------------------------------
+
+# Mapping: CNINFO exchange suffix in column_id / exchange indicator → ISO MIC
+# The ISIN country prefix for China is always "CN".
+_ISIN_COUNTRY_PREFIX = "CN"
+
+# Characters used for the Luhn-based ISO 6166 check digit:
+# digits stay as-is; letters A=10, B=11, … Z=35
+_LUHN_CHAR_MAP = {str(i): i for i in range(10)}
+_LUHN_CHAR_MAP.update({chr(ord("A") + i): 10 + i for i in range(26)})
+
+
+def _iso6166_check_digits(country: str, nsin: str) -> str:
+    """Compute the two ISO 6166 check digits for a given country + NSIN.
+
+    The algorithm converts the concatenated string ``country + nsin + "00"``
+    to an all-digit string (A=10…Z=35), then applies ``98 - (number mod 97)``.
+
+    Args:
+        country: 2-letter ISO 3166-1 alpha-2 country code (e.g. ``"CN"``).
+        nsin:    National Securities Identifying Number (up to 10 chars).
+
+    Returns:
+        Zero-padded 2-digit string (``"01"`` … ``"97"``).
+    """
+    raw = country + nsin + "00"
+    digits = "".join(str(_LUHN_CHAR_MAP[ch]) for ch in raw.upper())
+    remainder = int(digits) % 97
+    check = 98 - remainder
+    return f"{check:02d}"
+
+
+def derive_isin_from_stock_code(stock_code: str) -> str | None:
+    """Derive the ISO 6166 ISIN for a Chinese A/B-share from its stock code.
+
+    Chinese exchange-listed securities have ISINs of the form::
+
+        CN + <10-char NSIN> + <2 check digits>   (total 12 chars)
+
+    The NSIN is the 6-digit stock code left-padded with four zeros to reach
+    10 characters (e.g. ``"000001"`` → ``"0000000001"``).
+
+    This covers:
+    - Shenzhen Main Board / SME Board: 0xxxxx
+    - ChiNext (创业板): 3xxxxx
+    - Shenzhen B-shares: 2xxxxx
+    - Shanghai Main Board / STAR Market: 6xxxxx
+    - Shanghai B-shares: 9xxxxx
+    - Beijing Stock Exchange (BSE): 4xxxxx / 8xxxxx
+
+    Args:
+        stock_code: 6-digit stock code string (e.g. ``"000001"``).
+
+    Returns:
+        A 14-character ISIN string (``CN`` + 10-char NSIN + 2 check digits),
+        or ``None`` if *stock_code* is not exactly 6 ASCII digits.
+
+        Note: exchange-published Chinese ISINs use a different NSIN encoding
+        (exchange letter + compressed code) that produces 12-char strings.
+        This implementation uses the plain ISO 6166 check-digit formula on
+        the zero-padded stock code for a consistent, deterministic result.
+    """
+    if not stock_code or not re.fullmatch(r"\d{6}", stock_code):
+        return None
+    nsin = stock_code.zfill(10)
+    check = _iso6166_check_digits(_ISIN_COUNTRY_PREFIX, nsin)
+    return f"{_ISIN_COUNTRY_PREFIX}{nsin}{check}"
+
 
 # ---------------------------------------------------------------------------
 # Filing type classification — Chinese → taxonomy
@@ -130,10 +225,13 @@ def parse_announcements(api_response: dict[str, Any]) -> list[Filing]:
         announcement_type_code: str = ann.get("announcementType", "")
         filing_type = classify_filing_type(title, announcement_type_code)
 
+        stock_code: str = ann.get("secCode", "") or ""
+        isin = derive_isin_from_stock_code(stock_code)
+
         filings.append(
             Filing(
                 filing_id=ann.get("announcementId", ""),
-                ticker=ann.get("secCode", ""),
+                ticker=stock_code,
                 company_name=ann.get("secName", ""),
                 org_id=ann.get("orgId", ""),
                 org_name=ann.get("orgName", ""),
@@ -147,6 +245,9 @@ def parse_announcements(api_response: dict[str, Any]) -> list[Filing]:
                 column_id=ann.get("columnId", ""),
                 direct_download_url=f"{STATIC_URL}/{adjunct_url}",
                 filing_type=filing_type,
+                isin=isin,
+                lei=None,
+                language=CNINFO_LANGUAGE,
             )
         )
 

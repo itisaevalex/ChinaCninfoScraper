@@ -68,7 +68,14 @@ def mem_db() -> sqlite3.Connection:
 @pytest.fixture
 def sample_filing():
     """A valid Filing dataclass instance for DB tests (L3 schema)."""
+    import sys
+    import os
+    root = str(Path(__file__).parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
     from db import Filing
+    from parsers import derive_isin_from_stock_code
 
     return Filing(
         filing_id="1219488813",
@@ -86,13 +93,22 @@ def sample_filing():
         column_id="col_szse_annual",
         direct_download_url="http://static.cninfo.com.cn/finalpage/2024-03-30/1219488813.PDF",
         filing_type="annual_report",
+        isin=derive_isin_from_stock_code("000001"),
+        lei=None,
+        language="zh",
     )
 
 
 @pytest.fixture
 def sample_filing_2():
     """A second distinct Filing dataclass instance for batch/dedup tests."""
+    import sys
+    root = str(Path(__file__).parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
     from db import Filing
+    from parsers import derive_isin_from_stock_code
 
     return Filing(
         filing_id="2300145722",
@@ -110,4 +126,7 @@ def sample_filing_2():
         column_id="col_sse_semi",
         direct_download_url="http://static.cninfo.com.cn/finalpage/2023-08-15/2300145722.PDF",
         filing_type="half_yearly",
+        isin=derive_isin_from_stock_code("600519"),
+        lei=None,
+        language="zh",
     )
